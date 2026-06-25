@@ -43,6 +43,13 @@ from pydantic import BaseModel, Field, HttpUrl
 # Config
 # ---------------------------------------------------------------------------
 
+# Load .env before reading any VIDEOARM_* vars below. start_api.sh launches
+# uvicorn on this module directly (not via main.py), so without this the
+# server would ignore .env entirely — including VIDEOARM_YTDLP_PROXY/COOKIES.
+from dotenv import load_dotenv  # noqa: PLC0415
+
+load_dotenv()
+
 API_KEY     = os.getenv("VIDEOARM_API_KEY", "change-me")
 OUTPUT_ROOT = Path(os.getenv("VIDEOARM_OUTPUT_DIR", "/tmp/videoarm_jobs"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -51,6 +58,26 @@ MAX_WORKERS = int(os.getenv("VIDEOARM_WORKERS", "2"))
 
 # Upper bound for caller-supplied prompts on /v1/summarize/custom (chars).
 MAX_PROMPT_CHARS = int(os.getenv("VIDEOARM_MAX_PROMPT_CHARS", "20000"))
+
+# YouTube download hardening. From a datacenter IP (e.g. GCP) YouTube often
+# answers "Sign in to confirm you're not a bot"; cookies and/or a residential
+# proxy are the reliable fixes, and alternate player clients frequently dodge
+# the check without either. All optional — defaults keep prior behaviour plus
+# the client fallback chain.
+YTDLP_COOKIES        = os.getenv("VIDEOARM_YTDLP_COOKIES")  # path to cookies.txt
+YTDLP_COOKIES_BROWSER = os.getenv("VIDEOARM_YTDLP_COOKIES_FROM_BROWSER")  # e.g. "chrome"
+YTDLP_PROXY          = os.getenv("VIDEOARM_YTDLP_PROXY")  # e.g. http://user:pass@host:port
+# Player clients tried in order until one succeeds. Mobile clients are far less
+# likely to hit the bot wall than "web", and "android" reliably exposes the
+# separate video+audio streams our format selector wants — from a datacenter IP
+# it is usually the only client that works without cookies, so it leads. tv/ios
+# frequently expose no mergeable format (extraction returns nothing), so they
+# follow as fallbacks rather than the default first attempt.
+YTDLP_PLAYER_CLIENTS = [
+    c.strip() for c in
+    os.getenv("VIDEOARM_YTDLP_PLAYER_CLIENTS", "android,ios,tv,web_safari,web").split(",")
+    if c.strip()
+]
 
 _YOUTUBE_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com",
@@ -581,24 +608,81 @@ def _download_youtube(url: str, dest_dir: Path) -> tuple[str, Optional[str]]:
     """
     import yt_dlp  # noqa: PLC0415
 
-    ydl_opts = {
+    from videoarm.core.ffmpeg_utils import ffmpeg_path  # noqa: PLC0415
+
+    class _QuietLogger:
+        """Swallow yt-dlp's own logging. We try several player clients and the
+        losing ones emit ERROR lines to stderr ("Requested format is not
+        available", the bot wall, …); those are expected and handled by the
+        fallback loop, so we suppress them and raise our own message instead."""
+
+        def debug(self, msg): pass
+        def info(self, msg): pass
+        def warning(self, msg): pass
+        def error(self, msg): pass
+
+    base_opts = {
         "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
         "outtmpl": str(dest_dir / "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
+        # Point yt-dlp at our resolved ffmpeg so stream merging works even when
+        # ffmpeg is not installed system-wide. ffmpeg_location accepts the
+        # binary's directory (or the binary itself).
+        "ffmpeg_location": ffmpeg_path(),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        "logger": _QuietLogger(),
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        # requested_downloads[].filepath reflects the final (post-merge) file.
-        downloads = info.get("requested_downloads") or []
-        path = downloads[0]["filepath"] if downloads else ydl.prepare_filename(info)
+    if YTDLP_COOKIES:
+        base_opts["cookiefile"] = YTDLP_COOKIES
+    if YTDLP_COOKIES_BROWSER:
+        # yt-dlp expects a tuple: (browser, profile, keyring, container).
+        base_opts["cookiesfrombrowser"] = (YTDLP_COOKIES_BROWSER,)
+    if YTDLP_PROXY:
+        base_opts["proxy"] = YTDLP_PROXY
 
-    if not path or not Path(path).exists():
-        raise RuntimeError("yt-dlp did not produce a video file")
-    return path, info.get("title")
+    def _client_dependent(err: Exception) -> bool:
+        """Failures that another player client may avoid: the bot wall, and the
+        format quirks of leaner clients (tv/ios sometimes expose no format that
+        satisfies our selector)."""
+        msg = str(err).lower()
+        return (
+            "sign in to confirm" in msg
+            or "not a bot" in msg
+            or "requested format is not available" in msg
+        )
+
+    # Try each player client in turn; client-dependent failures fall through to
+    # the next client, while fatal errors (DRM, private, geo-block, …) abort.
+    last_exc: Optional[Exception] = None
+    for client in YTDLP_PLAYER_CLIENTS or [None]:
+        opts = dict(base_opts)
+        if client:
+            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                # requested_downloads[].filepath is the final (post-merge) file.
+                downloads = info.get("requested_downloads") or []
+                path = downloads[0]["filepath"] if downloads else ydl.prepare_filename(info)
+            if not path or not Path(path).exists():
+                raise RuntimeError("yt-dlp did not produce a video file")
+            return path, info.get("title")
+        except yt_dlp.utils.DownloadError as exc:
+            last_exc = exc
+            if _client_dependent(exc):
+                continue  # try the next player client
+            raise
+
+    # Every client hit the bot wall. Surface an actionable message.
+    raise RuntimeError(
+        "YouTube blocked the download as a suspected bot across all player "
+        "clients. Set VIDEOARM_YTDLP_COOKIES (path to a cookies.txt exported "
+        "from a logged-in browser) and/or VIDEOARM_YTDLP_PROXY (a residential "
+        f"proxy) to authenticate. Last error: {last_exc}"
+    )
 
 
 def _run_job_from_youtube(
