@@ -10,6 +10,14 @@ set -euo pipefail
 export VIDEOARM_API_KEY="${VIDEOARM_API_KEY:-7db96b28bfafe87a851c22000e9758c5}"
 export VIDEOARM_OUTPUT_DIR="${VIDEOARM_OUTPUT_DIR:-/tmp/videoarm_jobs}"
 
+# Summarizer concurrency. The vLLM backend batches concurrent requests, so
+# running segments and their vision calls in parallel keeps the A100 busy.
+# Measured on a 15.5-min/4-segment video: 242s (1x1) → 129s at 3x6 (~1.9x).
+# Past this the single-GPU vision model is compute-bound — raise for longer
+# videos / more GPU, lower if you hit memory pressure.
+export VIDEOARM_SEGMENT_CONCURRENCY="${VIDEOARM_SEGMENT_CONCURRENCY:-3}"
+export VIDEOARM_VISUAL_CONCURRENCY="${VIDEOARM_VISUAL_CONCURRENCY:-6}"
+
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
 
