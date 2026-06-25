@@ -634,6 +634,13 @@ def _download_youtube(url: str, dest_dir: Path) -> tuple[str, Optional[str]]:
         "no_warnings": True,
         "noprogress": True,
         "logger": _QuietLogger(),
+        # YouTube now forces SABR streaming and an obfuscated "n" challenge on
+        # most videos; without solving it yt-dlp only sees storyboards and fails
+        # with "Requested format is not available". Solving needs a JS runtime
+        # (Deno, on PATH) plus yt-dlp's EJS solver script, which is a remote
+        # component disabled by default — opt in here. A bgutil PO-token
+        # provider (HTTP server on :4416) supplies the GVS PO token in tandem.
+        "remote_components": {"ejs:github"},
     }
     if YTDLP_COOKIES:
         base_opts["cookiefile"] = YTDLP_COOKIES
