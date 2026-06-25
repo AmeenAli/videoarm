@@ -20,9 +20,11 @@ Concatenate per-segment LaTeX sections → full document → xelatex → PDF.
 """
 
 import json
+import os
 import re
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -311,6 +313,13 @@ class LectureSummarizer:
     FIGURE_SAMPLES: int     = 15  # frames to sample per segment for figure selection
     FIGURE_MAX: int         = 3   # max figures to include per segment
 
+    # Concurrency. The vLLM backend does continuous batching, so issuing the
+    # independent model calls in parallel keeps the GPU busy and cuts wall-clock
+    # time with no quality change. Peak concurrent requests ≈ the product of the
+    # two; defaults stay well within vLLM's max-num-seqs on a single A100.
+    SEGMENT_CONCURRENCY: int = int(os.getenv("VIDEOARM_SEGMENT_CONCURRENCY", "2"))
+    VISUAL_CONCURRENCY: int  = int(os.getenv("VIDEOARM_VISUAL_CONCURRENCY", "4"))
+
     def __init__(self, model_name: Optional[str] = None) -> None:
         from videoarm.core.agent import VideoARMAgent
         self.agent  = VideoARMAgent(model_name=model_name)
@@ -408,19 +417,34 @@ class LectureSummarizer:
               f"grid images across "
               f"{self.SEGMENT_SECS // self.VISUAL_SUBSEG_SECS} sub-windows\n")
 
-        latex_sections: List[str] = []
-        for idx, seg in enumerate(segments, 1):
-            t0 = seg["start_time"]
-            t1 = seg["end_time"]
-            print(f"┌─ Segment {idx}/{len(segments)} "
+        # Process segments concurrently — each is independent and the heavy work
+        # is GPU model calls the vLLM backend batches happily. Results are
+        # reassembled in document order regardless of completion order; progress
+        # fires per completion. SEGMENT_CONCURRENCY=1 restores sequential order.
+        n_segs = len(segments)
+        latex_sections: List[str] = [""] * n_segs
+        done_count = 0
+
+        def _run_segment(idx: int, seg: Dict[str, Any]) -> str:
+            t0, t1 = seg["start_time"], seg["end_time"]
+            print(f"┌─ Segment {idx + 1}/{n_segs} "
                   f"({t0:.0f}s–{t1:.0f}s, {(t1-t0)/60:.1f} min) ─────────")
-            section_tex = self._process_segment(
-                video_path, seg, video_info, idx, len(segments)
-            )
-            latex_sections.append(section_tex)
-            print(f"└─ done ({len(section_tex)} chars of LaTeX)\n")
-            if on_progress:
-                on_progress(idx, len(segments))
+            tex = self._process_segment(video_path, seg, video_info, idx + 1, n_segs)
+            print(f"└─ Segment {idx + 1}/{n_segs} done ({len(tex)} chars of LaTeX)\n")
+            return tex
+
+        workers = max(1, min(self.SEGMENT_CONCURRENCY, n_segs))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_run_segment, idx, seg): idx
+                for idx, seg in enumerate(segments)
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                latex_sections[idx] = fut.result()
+                done_count += 1
+                if on_progress:
+                    on_progress(done_count, n_segs)
 
         body    = "\n\n".join(latex_sections)
         elapsed = time.time() - start_wall
@@ -570,7 +594,15 @@ class LectureSummarizer:
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
         }
 
-        all_notes: List[str] = []
+        # Per-segment temp namespace so concurrent segments never share frame
+        # files (named by global index → collide across resolutions/segments).
+        # Prefixed with the base session id so _cleanup_temp_frames still removes it.
+        sess = f"{self.agent.session_id}_v{seg['start_frame']}"
+
+        # Phase 1 (sequential, CPU): sample frames + build grids for every
+        # sub-window, flattening into independent vision-model tasks.
+        bs = self.VISUAL_BATCH_SIZE
+        tasks: List[Dict[str, Any]] = []
         for i, sub in enumerate(subsegs, 1):
             n_frames = max(1, int(self.VISUAL_FPS * sub["duration"]))
             try:
@@ -583,11 +615,11 @@ class LectureSummarizer:
                     total_frames=n_frames,
                     target_short_side=256,
                     silent=True,
+                    session_id=sess,
                 )
             except Exception as exc:
                 print(f"│    ⚠  sub-window {i} frame extraction failed: {exc}")
                 continue
-
             if not frame_paths:
                 continue
 
@@ -597,42 +629,64 @@ class LectureSummarizer:
                 cols=self.VISUAL_GRID_COLS,
             )
             image_list = [str(p) for p in composites] if composites else frame_paths
+            user_prompt = _VISUAL_EXTRACTION_USER.format(
+                start_time=sub["start_time"],
+                end_time=sub["end_time"],
+                sub_idx=i,
+                total_sub=n_sub,
+            )
+            for batch in (image_list[j:j+bs] for j in range(0, len(image_list), bs)):
+                tasks.append({
+                    "sub": i,
+                    "start": sub["start_time"],
+                    "end": sub["end_time"],
+                    "batch": batch,
+                    "prompt": user_prompt,
+                })
 
-            # Split into small batches to avoid vllm encoder-cache race condition under TP=2
-            batch_notes: List[str] = []
-            bs = self.VISUAL_BATCH_SIZE
-            batches = [image_list[j:j+bs] for j in range(0, len(image_list), bs)]
-            for b_idx, batch in enumerate(batches, 1):
-                user_prompt = _VISUAL_EXTRACTION_USER.format(
-                    start_time=sub["start_time"],
-                    end_time=sub["end_time"],
-                    sub_idx=i,
-                    total_sub=n_sub,
-                )
-                try:
-                    response = self.agent._run_with_retry(
-                        lambda imgs=batch, up=user_prompt: call_openai_model_with_tools(
-                            messages=[
-                                {"role": "system", "content": _VISUAL_EXTRACTION_SYSTEM},
-                                {"role": "user",   "content": up},
-                            ],
-                            model_name=model,
-                            endpoints=base_url,
-                            api_key=api_key,
-                            image_paths=imgs,
-                            **params,
-                        )
+        # Phase 2 (parallel, GPU): the vision calls are independent; run them
+        # concurrently and let vLLM batch them. pool.map preserves input order,
+        # so notes stay in sub-window → batch order.
+        def _call(task: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+            try:
+                response = self.agent._run_with_retry(
+                    lambda: call_openai_model_with_tools(
+                        messages=[
+                            {"role": "system", "content": _VISUAL_EXTRACTION_SYSTEM},
+                            {"role": "user",   "content": task["prompt"]},
+                        ],
+                        model_name=model,
+                        endpoints=base_url,
+                        api_key=api_key,
+                        image_paths=task["batch"],
+                        **params,
                     )
-                    content = (response or {}).get("content", "").strip()
-                    if content:
-                        batch_notes.append(content)
-                except Exception as exc:
-                    print(f"│    ⚠  sub-window {i} batch {b_idx}/{len(batches)} failed: {exc}")
+                )
+                return task, (response or {}).get("content", "").strip()
+            except Exception as exc:
+                print(f"│    ⚠  sub-window {task['sub']} batch failed: {exc}")
+                return task, ""
 
-            if batch_notes:
-                combined_sub = "\n".join(batch_notes)
-                all_notes.append(f"[{sub['start_time']:.0f}s–{sub['end_time']:.0f}s]\n{combined_sub}")
-                print(f"│    sub-window {i}/{n_sub}: {len(combined_sub)} chars")
+        # Accumulate batch outputs per sub-window, preserving order.
+        subs_acc: Dict[int, Dict[str, Any]] = {}
+        if tasks:
+            workers = max(1, min(self.VISUAL_CONCURRENCY, len(tasks)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for task, content in pool.map(_call, tasks):
+                    entry = subs_acc.setdefault(
+                        task["sub"], {"start": task["start"], "end": task["end"], "parts": []}
+                    )
+                    if content:
+                        entry["parts"].append(content)
+
+        all_notes: List[str] = []
+        for i in sorted(subs_acc):
+            entry = subs_acc[i]
+            if not entry["parts"]:
+                continue
+            combined_sub = "\n".join(entry["parts"])
+            all_notes.append(f"[{entry['start']:.0f}s–{entry['end']:.0f}s]\n{combined_sub}")
+            print(f"│    sub-window {i}/{n_sub}: {len(combined_sub)} chars")
 
         combined = "\n\n".join(all_notes)
         print(f"│       Total visual notes: {len(combined)} chars")
@@ -764,6 +818,9 @@ class LectureSummarizer:
                 total_frames=self.FIGURE_SAMPLES,
                 target_short_side=480,
                 silent=True,
+                # Own namespace: figure frames (480px) must not collide with the
+                # visual frames (256px) of this or any concurrent segment.
+                session_id=f"{self.agent.session_id}_g{seg['start_frame']}",
             )
         except Exception as exc:
             print(f"│  ⚠  Figure frame extraction failed: {exc}")

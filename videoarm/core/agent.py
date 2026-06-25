@@ -1310,8 +1310,17 @@ class VideoARMAgent:
         total_frames: int,
         target_short_side: int = 256,
         silent: bool = False,
+        session_id: Optional[str] = None,
     ) -> List[str]:
-        """Extract total_frames frames distributed proportionally across ranges."""
+        """Extract total_frames frames distributed proportionally across ranges.
+
+        ``session_id`` overrides the per-frame temp subdir (``tmp/<session_id>/``).
+        Callers running segments concurrently pass a per-segment id so their
+        frames never collide — frames are named by global index alone, and the
+        same index at different resolutions (visual 256px vs figure 480px) would
+        otherwise overwrite each other. Use a value prefixed with the job's base
+        session id so ``_cleanup_temp_frames`` still removes it.
+        """
         if not frame_ranges:
             return []
 
@@ -1334,7 +1343,7 @@ class VideoARMAgent:
                 start_frame=start,
                 end_frame=end,
                 num_frames=count,
-                session_id=self.session_id,
+                session_id=session_id or self.session_id,
                 target_short_side=target_short_side,
                 silent=silent,
             )
@@ -1362,8 +1371,15 @@ class VideoARMAgent:
         if not frame_paths:
             return []
 
+        import uuid  # noqa: PLC0415
+
         tile_count = rows * cols
         parent = Path(frame_paths[0]).parent
+        # Unique per call: the grid index restarts at 0 for every sub-window, so
+        # a fixed name would let concurrent visual-extraction calls overwrite
+        # each other's grids mid-read. A uuid tag keeps each call's grids
+        # distinct (and still under the session dir, so cleanup catches them).
+        tag = uuid.uuid4().hex[:8]
         composites: List[Path] = []
 
         for idx in range(0, len(frame_paths), tile_count):
@@ -1389,7 +1405,7 @@ class VideoARMAgent:
             grid = cv2.vconcat(
                 [cv2.hconcat(resized[r * cols: (r + 1) * cols]) for r in range(rows)]
             )
-            out = parent / f"{self.session_id}_grid_{idx // tile_count:03d}.png"
+            out = parent / f"{self.session_id}_grid_{tag}_{idx // tile_count:03d}.png"
             cv2.imwrite(str(out), grid)
             composites.append(out)
 
