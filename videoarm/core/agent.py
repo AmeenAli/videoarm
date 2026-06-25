@@ -986,7 +986,8 @@ class VideoARMAgent:
     # ------------------------------------------------------------------ #
 
     def _audio_transcriber(
-        self, video_path: str, frame_ranges: List[Dict], reason: str
+        self, video_path: str, frame_ranges: List[Dict], reason: str,
+        language: Optional[str] = None,
     ) -> Dict:
         """
         Extract audio from the specified frame ranges and transcribe with whisper-1.
@@ -994,26 +995,17 @@ class VideoARMAgent:
         Corresponds to Equation (2): A_C = AudioTrans(A), A ∈ P_s
         """
         import os
-        import subprocess
         import tempfile
+
+        from videoarm.core.ffmpeg_utils import has_audio_stream  # noqa: PLC0415
 
         reason = str(reason or "").strip()
         fps = self.video_info["fps"]
         total_frames = self.video_info["total_frames"]
         max_frames = self.config.get_pipeline_config("audio_max_frames")
 
-        # Check for audio stream
-        probe = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "a:0",
-                "-show_entries", "stream=codec_name",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(video_path),
-            ],
-            capture_output=True, text=True, timeout=10,
-        )
-        if not probe.stdout.strip():
+        # Check for audio stream (uses ffmpeg when system ffprobe is absent).
+        if not has_audio_stream(video_path):
             self.video_has_audio = False
             return {
                 "status": "no_audio",
@@ -1063,18 +1055,11 @@ class VideoARMAgent:
             if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
                 return {"error": "Audio extraction produced an empty file.", "reason": reason}
 
-            from openai import OpenAI
+            from videoarm.api.local_models import transcribe_audio_local
 
-            api_key, base_url = self.config.get_api_config("audio_transcriber")
-            client = OpenAI(api_key=api_key or None, base_url=base_url or None)
-
-            def _transcribe():
-                with open(tmp_path, "rb") as af:
-                    return client.audio.transcriptions.create(
-                        model="whisper-1", file=af, response_format="verbose_json"
-                    )
-
-            transcript = self._run_with_retry(_transcribe)
+            transcript = self._run_with_retry(
+                lambda: transcribe_audio_local(tmp_path, language=language)
+            )
 
             # Map relative timestamps back to global frame indices
             result_segs = []
@@ -1109,6 +1094,10 @@ class VideoARMAgent:
         import subprocess
         import tempfile
 
+        from videoarm.core.ffmpeg_utils import ffmpeg_path  # noqa: PLC0415
+
+        ffmpeg_bin = ffmpeg_path()
+
         def _ffmpeg(*args):
             r = subprocess.run(list(args), capture_output=True, text=True)
             if r.returncode != 0:
@@ -1126,7 +1115,7 @@ class VideoARMAgent:
                 raise RuntimeError("\n".join(errors) or r.stderr[-300:])
 
         base_args = [
-            "ffmpeg", "-y", "-i", video_path,
+            ffmpeg_bin, "-y", "-i", video_path,
             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
         ]
 
@@ -1158,7 +1147,7 @@ class VideoARMAgent:
                     f.write(f"file '{sf}'\n")
 
             _ffmpeg(
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
                 "-i", concat_list, "-c", "copy", out_path,
             )
         finally:
