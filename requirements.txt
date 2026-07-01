@@ -1,5 +1,28 @@
+# ── Video / image processing ─────────────────────────────────────────────────
 opencv-python>=4.8.0
-openai>=1.0.0
-requests>=2.28.0
-python-dotenv>=1.0.0
 numpy>=1.24.0
+
+# ── HTTP client (used directly for OpenAI-compatible / vllm endpoints) ────────
+requests>=2.28.0
+
+# ── YouTube download (yt-dlp) for the /v1/summarize/youtube endpoint ──────────
+yt-dlp>=2024.0.0
+
+# ── Local LLM / ASR inference ────────────────────────────────────────────────
+# These run Qwen/Qwen3.6-35B-A3B (via vllm server) and
+# Qwen/Qwen3-ASR-1.7B (loaded in-process via transformers).
+transformers>=4.45.0
+torch>=2.1.0
+accelerate>=0.26.0
+
+# ── Audio processing for local ASR ───────────────────────────────────────────
+soundfile>=0.12.0
+# librosa is optional but improves audio resampling quality:
+# librosa>=0.10.0
+
+# ── Env config ────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── vllm (install separately — GPU required for the 35B MoE model) ───────────
+# pip install vllm
+# See start_server.sh for the startup command.

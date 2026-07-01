@@ -208,3 +208,10 @@ __marimo__/
 
 # yt-dlp YouTube session cookies (secret)
 cookies.txt
+
+# Local media samples, generated notes, scratch, and Claude/agent artifacts
+*.mp4
+/tmp/
+/output/
+.claude/
+/memory/

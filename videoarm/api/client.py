@@ -107,6 +107,7 @@ def call_openai_model_with_tools(
     tool_choice: str = "auto",
     return_json: bool = False,
     request_timeout: float = 900.0,
+    extra_body: dict = None,
 ) -> dict:
     """
     Unified chat / tool-call wrapper for OpenAI-compatible endpoints.
@@ -147,6 +148,8 @@ def call_openai_model_with_tools(
         "model": model_name,
         "messages": copy.deepcopy(messages),
     }
+    if extra_body:
+        payload.update(extra_body)
     if return_json:
         payload["response_format"] = {"type": "json_object"}
     if tools:
@@ -173,7 +176,20 @@ def call_openai_model_with_tools(
     message = response.json()["choices"][0]["message"]
     if "tool_calls" in message:
         return message
-    return {"content": message["content"].strip(), "tool_calls": None}
+    content = (message.get("content") or "").strip()
+    # Strip Qwen3 thinking blocks: content may start with <think>...</think>
+    content = _strip_thinking(content)
+    return {"content": content, "tool_calls": None}
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks from Qwen3 model output."""
+    import re
+    # Strip explicit <think> tags
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Also strip bare </think> tags (opening tag stripped by server)
+    text = re.sub(r".*?</think>", "", text, flags=re.DOTALL)
+    return text.strip()
 
 
 def handle_json_parsing_error(content: str, context: str = "response") -> dict | None:

@@ -39,6 +39,8 @@ from fastapi import Depends, FastAPI, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
+from videoarm.latex.languages import normalize_code
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -126,6 +128,7 @@ def _init_db() -> None:
                 source         TEXT NOT NULL DEFAULT 'url',
                 title          TEXT NOT NULL DEFAULT 'Lecture Notes',
                 language       TEXT,
+                output_language TEXT NOT NULL DEFAULT 'en',
                 domain         TEXT NOT NULL DEFAULT '',
                 intent         TEXT NOT NULL DEFAULT '',
                 pdf_path       TEXT,
@@ -154,6 +157,7 @@ def _migrate_db() -> None:
         ("system_prompt",  "TEXT"),
         ("user_prompt",    "TEXT"),
         ("category",       "TEXT"),
+        ("output_language", "TEXT NOT NULL DEFAULT 'en'"),
     ]
     with _db() as conn:
         for col, defn in new_cols:
@@ -214,6 +218,7 @@ def _recover() -> None:
         # Custom jobs persist these; lecture jobs leave them NULL (treated as None).
         system_prompt = row["system_prompt"]
         user_prompt   = row["user_prompt"]
+        output_language = row["output_language"] or "en"
         if row["source"] == "youtube" and row["video_url"]:
             _executor.submit(
                 _run_job_from_youtube,
@@ -225,6 +230,7 @@ def _recover() -> None:
                 row["intent"],
                 system_prompt,
                 user_prompt,
+                output_language,
             )
         elif row["video_url"]:
             req = SimpleNamespace(
@@ -234,7 +240,8 @@ def _recover() -> None:
                 domain=row["domain"],
                 intent=row["intent"],
             )
-            _executor.submit(_run_job, row["job_id"], req, system_prompt, user_prompt)
+            _executor.submit(_run_job, row["job_id"], req, system_prompt,
+                             user_prompt, output_language)
         elif row["video_path"] and Path(row["video_path"]).exists():
             _executor.submit(
                 _run_job_from_path,
@@ -244,6 +251,7 @@ def _recover() -> None:
                 row["language"],
                 row["domain"],
                 row["intent"],
+                output_language,
             )
         else:
             _set(row["job_id"],
@@ -284,6 +292,10 @@ class SummarizeRequest(BaseModel):
     intent:    str           = ""
     title:     str           = "Lecture Notes"
     language:  Optional[str] = None
+    # Language the FINISHED notes are written in ("EN", "AR", "HE", …). Independent
+    # of `language` (the spoken/ASR language). Defaults to English; unknown codes
+    # fall back to English.
+    output_language: str     = "en"
 
 
 class YouTubeRequest(BaseModel):
@@ -293,6 +305,7 @@ class YouTubeRequest(BaseModel):
     # Defaults to the YouTube video's own title when left unset.
     title:    Optional[str] = None
     language: Optional[str] = None
+    output_language: str    = "en"
 
 
 class CustomSource(BaseModel):
@@ -308,6 +321,7 @@ class CustomRequest(BaseModel):
     source:        CustomSource
     title:         Optional[str] = None
     language:      Optional[str] = None
+    output_language: str = "en"           # language the finished notes are written in
     category:      Optional[str] = None  # free-form label, stored for record-keeping
     system_prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
     user_prompt:   str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
@@ -364,10 +378,11 @@ def _row_to_status(row: sqlite3.Row) -> JobStatus:
 def submit(req: SummarizeRequest, _: None = Depends(_require_key)) -> JobStatus:
     """Submit a video URL for lecture-note generation. Returns a job_id to poll."""
     job_id = uuid.uuid4().hex[:10]
+    out_lang = normalize_code(req.output_language)
     _insert(job_id, status="queued", video_url=str(req.video_url),
             title=req.title, language=req.language,
-            domain=req.domain, intent=req.intent)
-    _executor.submit(_run_job, job_id, req)
+            output_language=out_lang, domain=req.domain, intent=req.intent)
+    _executor.submit(_run_job, job_id, req, None, None, out_lang)
     return JobStatus(job_id=job_id, status="queued")
 
 
@@ -377,13 +392,16 @@ def submit_youtube(req: YouTubeRequest, _: None = Depends(_require_key)) -> JobS
     server-side with yt-dlp. If `title` is omitted the video's own title is used.
     Returns a job_id to poll."""
     job_id = uuid.uuid4().hex[:10]
+    out_lang = normalize_code(req.output_language)
     fields = dict(status="queued", source="youtube", video_url=str(req.url),
-                  language=req.language, domain=req.domain, intent=req.intent)
+                  language=req.language, output_language=out_lang,
+                  domain=req.domain, intent=req.intent)
     if req.title:  # otherwise let the DB default stand until yt-dlp resolves it
         fields["title"] = req.title
     _insert(job_id, **fields)
     _executor.submit(_run_job_from_youtube, job_id, str(req.url),
-                     req.title, req.language, req.domain, req.intent)
+                     req.title, req.language, req.domain, req.intent,
+                     None, None, out_lang)
     return JobStatus(job_id=job_id, status="queued")
 
 
@@ -394,6 +412,7 @@ async def submit_upload(
     intent:   str           = Form(default=""),
     title:    str           = Form(default="Lecture Notes"),
     language: Optional[str] = Form(default=None),
+    output_language: str    = Form(default="en"),
     _: None = Depends(_require_key),
 ) -> JobStatus:
     """Upload a local video file for lecture-note generation. Returns a job_id to poll."""
@@ -404,9 +423,12 @@ async def submit_upload(
             fh.write(chunk)
 
     job_id = uuid.uuid4().hex[:10]
+    out_lang = normalize_code(output_language)
     _insert(job_id, status="queued", video_path=tmp_path,
-            title=title, language=language, domain=domain, intent=intent)
-    _executor.submit(_run_job_from_path, job_id, tmp_path, title, language, domain, intent)
+            title=title, language=language, output_language=out_lang,
+            domain=domain, intent=intent)
+    _executor.submit(_run_job_from_path, job_id, tmp_path, title, language,
+                     domain, intent, out_lang)
     return JobStatus(job_id=job_id, status="queued")
 
 
@@ -452,7 +474,9 @@ def submit_custom(req: CustomRequest, _: None = Depends(_require_key)) -> JobSta
     url    = str(req.source.url)
     is_yt  = req.source.kind == "youtube" or (req.source.kind is None and _is_youtube(url))
     title  = req.title or "Notes"
-    base   = dict(language=req.language, category=req.category,
+    out_lang = normalize_code(req.output_language)
+    base   = dict(language=req.language, output_language=out_lang,
+                  category=req.category,
                   system_prompt=req.system_prompt, user_prompt=req.user_prompt)
 
     if is_yt:
@@ -461,13 +485,15 @@ def submit_custom(req: CustomRequest, _: None = Depends(_require_key)) -> JobSta
             fields["title"] = title
         _insert(job_id, **fields)
         _executor.submit(_run_job_from_youtube, job_id, url, req.title,
-                         req.language, "", "", req.system_prompt, req.user_prompt)
+                         req.language, "", "", req.system_prompt, req.user_prompt,
+                         out_lang)
     else:
         _insert(job_id, status="queued", source="url", video_url=url,
                 title=title, **base)
         sreq = SimpleNamespace(video_url=url, title=title, language=req.language,
                                domain="", intent="")
-        _executor.submit(_run_job, job_id, sreq, req.system_prompt, req.user_prompt)
+        _executor.submit(_run_job, job_id, sreq, req.system_prompt,
+                         req.user_prompt, out_lang)
 
     return JobStatus(job_id=job_id, status="queued")
 
@@ -539,6 +565,7 @@ def _process(
     intent: str,
     system_prompt: Optional[str] = None,
     user_prompt: Optional[str] = None,
+    output_language: str = "en",
 ) -> None:
     try:
         _set(job_id, status="processing", started_at=time.time())
@@ -562,6 +589,7 @@ def _process(
             on_progress=_on_progress,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            output_language=output_language,
         )
         tex_path = pdf_path.replace(".pdf", ".tex") if pdf_path else None
         _set(job_id, status="done", pdf_path=pdf_path, tex_path=tex_path)
@@ -575,6 +603,7 @@ def _run_job(
     req,
     system_prompt: Optional[str] = None,
     user_prompt: Optional[str] = None,
+    output_language: str = "en",
 ) -> None:
     tmp_video: Optional[str] = None
     try:
@@ -590,7 +619,7 @@ def _run_job(
                     fh.write(chunk)
 
         _process(job_id, tmp_video, req.title, req.language, req.domain, req.intent,
-                 system_prompt, user_prompt)
+                 system_prompt, user_prompt, output_language)
 
     except Exception as exc:
         _set(job_id, status="failed", error=str(exc))
@@ -701,6 +730,7 @@ def _run_job_from_youtube(
     intent: str,
     system_prompt: Optional[str] = None,
     user_prompt: Optional[str] = None,
+    output_language: str = "en",
 ) -> None:
     dl_dir: Optional[Path] = None
     try:
@@ -713,7 +743,7 @@ def _run_job_from_youtube(
             _set(job_id, title=title)
 
         _process(job_id, video_path, title, language, domain, intent,
-                 system_prompt, user_prompt)
+                 system_prompt, user_prompt, output_language)
 
     except Exception as exc:
         _set(job_id, status="failed", error=str(exc))
@@ -730,9 +760,11 @@ def _run_job_from_path(
     language: Optional[str],
     domain: str,
     intent: str,
+    output_language: str = "en",
 ) -> None:
     try:
-        _process(job_id, tmp_video, title, language, domain, intent)
+        _process(job_id, tmp_video, title, language, domain, intent,
+                 output_language=output_language)
     finally:
         if Path(tmp_video).exists():
             Path(tmp_video).unlink(missing_ok=True)

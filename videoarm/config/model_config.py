@@ -16,14 +16,14 @@ class ModelConfig:
     # Default model assignments (matching paper's implementation details) #
     # ------------------------------------------------------------------ #
     DEFAULT_MODELS: Dict[str, str] = {
-        # Controller and Temporal Scoping Tools (paper: OpenAI o3)
-        "controller": "o3",
-        # Multimodal Understanding Tools — visual analysis (paper: GPT-4.1)
-        "clip_analyzer": "gpt-4.1",
-        # Scene Snapper caption model
-        "scene_snapper": "gpt-4.1",
-        # Audio Transcriber (paper: whisper-1)
-        "audio_transcriber": "whisper-1",
+        # Controller (local vllm — Qwen3.6-35B-A3B MoE, FP8 quantized)
+        "controller": "Qwen/Qwen3.6-35B-A3B-FP8",
+        # Clip Analyzer (local vllm)
+        "clip_analyzer": "Qwen/Qwen3.6-35B-A3B-FP8",
+        # Scene Snapper caption model (local vllm)
+        "scene_snapper": "Qwen/Qwen3.6-35B-A3B-FP8",
+        # Audio Transcriber — loaded locally via transformers, not via API
+        "audio_transcriber": "Qwen/Qwen3-ASR-1.7B",
     }
 
     # ------------------------------------------------------------------ #
@@ -77,9 +77,10 @@ class ModelConfig:
         models = self.DEFAULT_MODELS.copy()
 
         overrides = {
-            "controller": os.getenv("VIDEOARM_MODEL_CONTROLLER"),
-            "clip_analyzer": os.getenv("VIDEOARM_MODEL_CLIP_ANALYZER"),
-            "scene_snapper": os.getenv("VIDEOARM_MODEL_SCENE_SNAPPER"),
+            "controller":       os.getenv("VIDEOARM_MODEL_CONTROLLER"),
+            "clip_analyzer":    os.getenv("VIDEOARM_MODEL_CLIP_ANALYZER"),
+            "scene_snapper":    os.getenv("VIDEOARM_MODEL_SCENE_SNAPPER"),
+            # audio_transcriber is resolved at load time by local_models.py
             "audio_transcriber": os.getenv("VIDEOARM_MODEL_AUDIO_TRANSCRIBER"),
         }
         for component, value in overrides.items():
@@ -88,10 +89,18 @@ class ModelConfig:
         return models
 
     def _load_api_config(self) -> None:
-        self.default_api_key = os.getenv("OPENAI_API_KEY", "")
-        self.default_base_url = os.getenv("OPENAI_BASE_URL", "")
-        self.component_api_keys: Dict[str, str] = {}
+        # LLM components → vllm on port 8000
+        # ASR component  → vllm on port 8001 (separate server, separate GPU)
+        # vllm accepts any non-empty string as the API key ("EMPTY" is fine).
+        self.default_api_key  = os.getenv("OPENAI_API_KEY",   "EMPTY")
+        self.default_base_url = os.getenv("OPENAI_BASE_URL",  "http://localhost:8000/v1")
+        self.component_api_keys:  Dict[str, str] = {}
         self.component_base_urls: Dict[str, str] = {}
+
+        # Hard-code ASR to port 8001; any env var override still wins below.
+        self.component_base_urls["audio_transcriber"] = os.getenv(
+            "VIDEOARM_BASE_URL_AUDIO_TRANSCRIBER", "http://localhost:8001"
+        )
 
         for component in self._models:
             env = component.upper()

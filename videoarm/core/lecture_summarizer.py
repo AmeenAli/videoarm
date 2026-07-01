@@ -29,7 +29,35 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from videoarm.api.client import call_openai_model_with_tools
+from videoarm.latex.languages import LangSpec, resolve
 from videoarm.latex.renderer import build_and_compile
+
+
+def _language_directive(spec: LangSpec) -> str:
+    """Instruction telling the model which language to WRITE the notes in.
+
+    Injected into the system prompt so the finished notes — headings, prose,
+    definitions, captions, everything — come out in the caller's chosen output
+    language, regardless of the language spoken in the video."""
+    lang = spec.name
+    directive = (
+        f"OUTPUT LANGUAGE: Write ALL notes in {lang} — every section heading, "
+        f"sentence, definition, theorem statement, remark, and figure caption. "
+        f"The lecture audio and on-screen text may be in any language; translate "
+        f"and render everything into {lang}. Do NOT translate mathematics or code: "
+        f"LaTeX math is language-neutral, so keep variable names, symbols, and "
+        f"listings exactly as they are. Keep widely-standard technical terms or "
+        f"proper nouns in their conventional form, adding a gloss in {lang} where "
+        f"it aids understanding."
+    )
+    if spec.rtl:
+        directive += (
+            f" The document is typeset right-to-left automatically — simply write "
+            f"natural {lang} prose and add no direction/bidi commands; leave every "
+            f"LaTeX math expression and inline code in ordinary left-to-right form "
+            f"(the compiler handles bidirectionality)."
+        )
+    return directive
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +68,6 @@ _SYSTEM_NOTE_TAKER = """\
 You are the most meticulous academic note-taker who has ever attended a \
 university lecture. Future students will study SOLELY from your notes — \
 completeness, accuracy, and professional quality are paramount.
-
-LANGUAGE: Write ALL notes in English. If the lecturer speaks or writes in \
-another language, translate everything into English. Preserve non-Latin \
-slide text in brackets followed by a translation: [שדה] (field).
 
 ════════════════════════════════════════════════════
   AUDIO TRANSCRIPTION RULES
@@ -342,6 +366,7 @@ class LectureSummarizer:
         on_progress: Optional[Callable[[int, int], None]] = None,
         system_prompt: Optional[str] = None,
         user_prompt: Optional[str] = None,
+        output_language: str = "en",
     ) -> str:
         """
         Process a lecture video end-to-end and return the path to the PDF.
@@ -355,6 +380,11 @@ class LectureSummarizer:
             language:    ISO 639-1 code for ASR (e.g. "he"). None = auto-detect.
             domain:      Lecture subject area, e.g. "Linear Algebra".
             intent:      Short focus instruction from the user, e.g. "Emphasise proofs".
+            output_language: Short code for the language the finished notes are
+                         WRITTEN in ("en", "ar", "he", …); independent of `language`
+                         (the spoken/ASR language). Unknown codes fall back to
+                         English. Drives both the generation prompt and the LaTeX
+                         preamble (direction, script font, localized labels).
             system_prompt: Custom top-level generation instruction. When provided it
                          REPLACES the built-in lecture note-taker system prompt (and the
                          domain block), enabling non-lecture categories. The synthesis
@@ -370,10 +400,18 @@ class LectureSummarizer:
         self._output_dir  = output_dir
         self._custom_user_prompt = (user_prompt or "").strip() or None
 
+        lang_spec = resolve(output_language)
+        self._output_language = lang_spec.code
+        directive = _language_directive(lang_spec)
+
         if system_prompt and system_prompt.strip():
             # Custom mode: caller supplies the full generation instruction. Do not
-            # mix in the lecture note-taker prompt or the domain block.
+            # mix in the lecture note-taker prompt or the domain block. Only enforce
+            # the output language when the caller explicitly asked for a non-English
+            # one — otherwise the caller's own prompt controls the language.
             self._system_prompt = system_prompt
+            if lang_spec.code != "en":
+                self._system_prompt += "\n\n" + directive
         else:
             domain_block = (
                 f"\n\nLECTURE DOMAIN: {self._domain}\n"
@@ -381,7 +419,7 @@ class LectureSummarizer:
                 "Use the standard conventions of this field for symbols and definitions."
                 if self._domain else ""
             )
-            self._system_prompt = _SYSTEM_NOTE_TAKER + domain_block
+            self._system_prompt = _SYSTEM_NOTE_TAKER + "\n\n" + directive + domain_block
         print("=" * 60)
         print("VideoARM — Lecture Summarizer")
         print("=" * 60)
@@ -389,7 +427,9 @@ class LectureSummarizer:
         print(f"  Title    : {title}")
         print(f"  Domain   : {self._domain or '(not specified)'}")
         print(f"  Intent   : {self._intent or '(not specified)'}")
-        print(f"  Language : {language or 'auto-detect'}")
+        print(f"  Language : {language or 'auto-detect'} (ASR)")
+        print(f"  Output   : {lang_spec.name} [{lang_spec.code}]"
+              f"{' — RTL' if lang_spec.rtl else ''}")
         print(f"  Visual   : {self.VISUAL_FPS:.0f} fps  "
               f"({self.VISUAL_SUBSEG_SECS}s sub-windows, "
               f"{self.VISUAL_GRID_ROWS}×{self.VISUAL_GRID_COLS} grids)")
@@ -453,6 +493,7 @@ class LectureSummarizer:
         pdf_path = build_and_compile(
             body=body, title=title, course=course,
             output_dir=output_dir, stem=stem,
+            output_language=self._output_language,
         )
 
         self.agent._cleanup_temp_frames()
@@ -522,20 +563,30 @@ class LectureSummarizer:
         seg_num: int,
         total_segs: int,
     ) -> str:
+        _t = {}
+        _s = time.time()
         transcript   = self._transcribe_segment(
             video_path, seg, video_info,
             language=getattr(self, "_language", None),
         )
+        _t["transcribe"] = time.time() - _s; _s = time.time()
         visual_notes, n_subsegs = self._extract_visual_content(
             video_path, seg, video_info,
         )
+        _t["visual"] = time.time() - _s; _s = time.time()
         figures = self._select_key_figures(video_path, seg, seg_num)
+        _t["figures"] = time.time() - _s; _s = time.time()
         latex = self._synthesise_latex_section(
             seg, transcript, visual_notes, n_subsegs, seg_num, total_segs, figures,
         )
+        _t["synthesis"] = time.time() - _s; _s = time.time()
         if not latex:
             return _fallback_section(seg, transcript, visual_notes)
-        return self._postprocess_latex(latex, seg_num, total_segs)
+        out = self._postprocess_latex(latex, seg_num, total_segs)
+        _t["postprocess"] = time.time() - _s
+        print("│  ⏱  seg %d timing: %s" % (
+            seg_num, "  ".join(f"{k}={v:.0f}s" for k, v in _t.items())))
+        return out
 
     # ------------------------------------------------------------------ #
     # Step 1 — Audio transcription                                        #
