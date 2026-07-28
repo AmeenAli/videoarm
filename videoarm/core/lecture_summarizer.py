@@ -394,10 +394,60 @@ class LectureSummarizer:
                          per-segment synthesis template. Only used when system_prompt is
                          also provided.
         """
+        start_wall = time.time()
+        body = self.summarize_body(
+            video_path=video_path,
+            title=title,
+            output_dir=output_dir,
+            language=language,
+            domain=domain,
+            intent=intent,
+            on_progress=on_progress,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            output_language=output_language,
+        )
+
+        pdf_path = build_and_compile(
+            body=body, title=title, course=course,
+            output_dir=output_dir, stem=stem,
+            output_language=self._output_language,
+        )
+
+        print("\n" + "=" * 60)
+        print(f"Done in {time.time() - start_wall:.0f}s")
+        print(f"PDF: {pdf_path}")
+        print("=" * 60)
+        return pdf_path
+
+    def summarize_body(
+        self,
+        video_path: str,
+        title: str = "Lecture Notes",
+        output_dir: str = "output",
+        language: Optional[str] = None,
+        domain: str = "",
+        intent: str = "",
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        system_prompt: Optional[str] = None,
+        user_prompt: Optional[str] = None,
+        output_language: str = "en",
+        figure_prefix: str = "",
+    ) -> str:
+        """Run the full understanding pipeline and return the LaTeX BODY, without
+        compiling a document. `summarize` wraps this with `build_and_compile`;
+        multi-video jobs (videoarm.core.multi_summarizer) call it per video and
+        stitch the bodies into one document.
+
+        `figure_prefix` namespaces the figure files copied into
+        `<output_dir>/figures/` so several videos sharing an output_dir cannot
+        overwrite each other's screenshots (segment numbering restarts per video).
+        """
         self._language    = language
         self._domain      = domain.strip()
         self._intent      = intent.strip()
         self._output_dir  = output_dir
+        self._figure_prefix = figure_prefix
         self._custom_user_prompt = (user_prompt or "").strip() or None
 
         lang_spec = resolve(output_language)
@@ -433,7 +483,7 @@ class LectureSummarizer:
         print(f"  Visual   : {self.VISUAL_FPS:.0f} fps  "
               f"({self.VISUAL_SUBSEG_SECS}s sub-windows, "
               f"{self.VISUAL_GRID_ROWS}×{self.VISUAL_GRID_COLS} grids)")
-        print(f"  Output   : {output_dir}/{stem}.pdf")
+        print(f"  Output   : {output_dir}/")
         print("=" * 60)
 
         start_wall = time.time()
@@ -488,20 +538,10 @@ class LectureSummarizer:
 
         body    = "\n\n".join(latex_sections)
         elapsed = time.time() - start_wall
-        print(f"All segments processed in {elapsed:.0f}s — compiling PDF …\n")
-
-        pdf_path = build_and_compile(
-            body=body, title=title, course=course,
-            output_dir=output_dir, stem=stem,
-            output_language=self._output_language,
-        )
+        print(f"All segments processed in {elapsed:.0f}s\n")
 
         self.agent._cleanup_temp_frames()
-        print("\n" + "=" * 60)
-        print(f"Done in {elapsed:.0f}s")
-        print(f"PDF: {pdf_path}")
-        print("=" * 60)
-        return pdf_path
+        return body
 
     # ------------------------------------------------------------------ #
     # Segment planning                                                     #
@@ -931,7 +971,8 @@ class LectureSummarizer:
             if not isinstance(idx, int) or not (0 <= idx < n) or not caption:
                 continue
             src = Path(str(frame_paths[idx]))
-            dest_name = f"seg{seg_num:02d}_fig{len(results)}{src.suffix}"
+            prefix = getattr(self, "_figure_prefix", "")
+            dest_name = f"{prefix}seg{seg_num:02d}_fig{len(results)}{src.suffix}"
             dest = figures_dir / dest_name
             shutil.copy2(src, dest)
             rel_path = f"figures/{dest_name}"

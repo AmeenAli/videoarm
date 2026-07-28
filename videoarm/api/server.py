@@ -8,6 +8,8 @@ POST /v1/summarize/youtube  Submit a YouTube link (downloaded with yt-dlp)
 POST /v1/summarize/upload   Upload a local video file
 POST /v1/summarize/custom   Submit a video URL (direct or YouTube) with a custom
                             system_prompt + user_prompt (non-lecture categories)
+POST /v1/summarize/multi    Submit a STACK of videos as one job → one combined
+                            PDF (see videoarm/api/multi.py; also /multi/upload)
 GET  /v1/jobs               List all jobs (newest first)
 GET  /v1/jobs/{job_id}      Poll job status
 GET  /v1/jobs/{job_id}/pdf  Download the finished PDF
@@ -137,6 +139,7 @@ def _init_db() -> None:
                 system_prompt  TEXT,
                 user_prompt    TEXT,
                 category       TEXT,
+                sources_json   TEXT,
                 segments_done  INTEGER NOT NULL DEFAULT 0,
                 segments_total INTEGER NOT NULL DEFAULT 0,
                 started_at     REAL,
@@ -158,6 +161,7 @@ def _migrate_db() -> None:
         ("user_prompt",    "TEXT"),
         ("category",       "TEXT"),
         ("output_language", "TEXT NOT NULL DEFAULT 'en'"),
+        ("sources_json",   "TEXT"),   # multi-video jobs: ordered source list
     ]
     with _db() as conn:
         for col, defn in new_cols:
@@ -208,7 +212,7 @@ def _recover() -> None:
     with _db() as conn:
         conn.execute(
             "UPDATE jobs SET status = 'failed', error = 'Interrupted by server restart' "
-            "WHERE status = 'processing'"
+            "WHERE status IN ('processing', 'downloading')"
         )
         queued = conn.execute(
             "SELECT * FROM jobs WHERE status = 'queued'"
@@ -219,7 +223,12 @@ def _recover() -> None:
         system_prompt = row["system_prompt"]
         user_prompt   = row["user_prompt"]
         output_language = row["output_language"] or "en"
-        if row["source"] == "youtube" and row["video_url"]:
+        if row["source"] == "multi":
+            # Multi-video jobs live in their own module; it re-downloads
+            # URL/YouTube sources and checks uploaded files are still on disk.
+            from videoarm.api.multi import resume_multi_job  # noqa: PLC0415
+            _executor.submit(resume_multi_job, row)
+        elif row["source"] == "youtube" and row["video_url"]:
             _executor.submit(
                 _run_job_from_youtube,
                 row["job_id"],
@@ -266,6 +275,13 @@ def _recover() -> None:
 _init_db()
 _migrate_db()
 app = FastAPI(title="VideoARM", version="1.0.0")
+
+# Multi-video route (stack of videos → one combined PDF) is a self-contained
+# module; it imports this module's helpers lazily, so mounting it here is the
+# only coupling. Single-video endpoints below are unaffected.
+from videoarm.api.multi import router as _multi_router  # noqa: E402, PLC0415
+
+app.include_router(_multi_router)
 
 
 @app.on_event("startup")
