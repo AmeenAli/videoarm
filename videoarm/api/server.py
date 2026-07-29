@@ -11,6 +11,9 @@ POST /v1/summarize/custom   Submit a video URL (direct or YouTube) with a custom
 POST /v1/summarize/multi    Submit a STACK of videos as one job → one combined
                             PDF (see videoarm/api/multi.py; also /multi/upload
                             and /multi/custom for caller-supplied prompts)
+POST /v1/describe           Perception-only job: timestamped JSON timeline of
+                            what is seen/heard, no analysis (videoarm/api/
+                            describe.py; result via /v1/jobs/{id}/semantic)
 GET  /v1/jobs               List all jobs (newest first)
 GET  /v1/jobs/{job_id}      Poll job status
 GET  /v1/jobs/{job_id}/pdf  Download the finished PDF
@@ -167,6 +170,8 @@ def _migrate_db() -> None:
         ("category",       "TEXT"),
         ("output_language", "TEXT NOT NULL DEFAULT 'en'"),
         ("sources_json",   "TEXT"),   # multi-video jobs: ordered source list
+        ("describe_params", "TEXT"),  # describe jobs: {kind, window_secs, keyframes}
+        ("semantic_path",  "TEXT"),   # describe jobs: path of the JSON timeline
     ]
     with _db() as conn:
         for col, defn in new_cols:
@@ -233,6 +238,9 @@ def _recover() -> None:
             # URL/YouTube sources and checks uploaded files are still on disk.
             from videoarm.api.multi import resume_multi_job  # noqa: PLC0415
             _executor.submit(resume_multi_job, row)
+        elif row["source"] == "describe":
+            from videoarm.api.describe import resume_describe_job  # noqa: PLC0415
+            _executor.submit(resume_describe_job, row)
         elif row["source"] == "youtube" and row["video_url"]:
             _executor.submit(
                 _run_job_from_youtube,
@@ -287,6 +295,8 @@ app = FastAPI(title="VideoARM", version="1.0.0")
 from videoarm.api.multi import router as _multi_router  # noqa: E402, PLC0415
 
 app.include_router(_multi_router)
+from videoarm.api.describe import router as _describe_router  # noqa: E402
+app.include_router(_describe_router)
 
 
 @app.on_event("startup")
@@ -353,6 +363,7 @@ class JobStatus(BaseModel):
     status:                      str   # queued | downloading | processing | done | failed
     pdf_url:                     Optional[str] = None
     tex_url:                     Optional[str] = None
+    semantic_url:                Optional[str] = None  # describe jobs only
     error:                       Optional[str] = None
     segments_done:               int   = 0
     segments_total:              int   = 0
@@ -379,11 +390,13 @@ def _row_to_status(row: sqlite3.Row) -> JobStatus:
             est = int(secs_per_seg * (total - done))
 
     is_done = row["status"] == "done"
+    is_describe = row["source"] == "describe"
     return JobStatus(
         job_id=row["job_id"],
         status=row["status"],
-        pdf_url=f"/v1/jobs/{row['job_id']}/pdf" if is_done else None,
-        tex_url=f"/v1/jobs/{row['job_id']}/tex" if is_done else None,
+        pdf_url=f"/v1/jobs/{row['job_id']}/pdf" if is_done and not is_describe else None,
+        tex_url=f"/v1/jobs/{row['job_id']}/tex" if is_done and not is_describe else None,
+        semantic_url=f"/v1/jobs/{row['job_id']}/semantic" if is_done and is_describe else None,
         error=row["error"],
         segments_done=done,
         segments_total=total,
