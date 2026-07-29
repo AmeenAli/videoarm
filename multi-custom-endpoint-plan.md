@@ -210,6 +210,6 @@ figure paths. Then a failure run with one dead URL → `failed` + `"Video 1/2"` 
 2. Implement + run `test_multi_custom.py` offline.
 3. Restart only the API server (`bash start_api.sh`) — model servers untouched;
    queued jobs survive, in-flight jobs fail with the standard restart message.
-4. Live smoke test through the public IP (currently `34.71.177.8`; verify via GCP
+4. Live smoke test through the public IP (currently `35.253.209.85`; verify via GCP
    metadata first — it rotates), from off-box (GCP hairpinning).
 5. Update the docs above with the verified examples; send Adam the handoff update.
