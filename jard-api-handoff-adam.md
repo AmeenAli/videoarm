@@ -4,19 +4,19 @@
 > new server address, the API key, every endpoint, and copy‑paste examples.
 >
 > **Owner:** Ameen — ping me if anything below 502s or the address changes.
-> **Last updated:** 24 July 2026.
+> **Last updated:** 29 July 2026.
 
 ---
 
 ## 0. TL;DR — what changed
 
-- **The server IP changed.** New base URL is **`http://35.253.209.85:8080`**.
-  All the older docs (and any hard‑coded `8.231.35.198` / `35.224.182.54`) are **stale** — update them.
+- **The server has a stable address now.** Base URL is **`http://spark.jard.ai:8080`** — a domain
+  backed by a **static IP**, so it survives VM restarts. Any hard‑coded IPs from older docs
+  (`8.231.35.198` / `35.224.182.54` / `34.71.177.8` / `35.253.209.85`) are **stale** — update them.
 - The API key, endpoints, request/response shapes, and behaviour are **unchanged**.
-  If you already integrated against the old address, the *only* thing you touch is the base URL.
-- **The IP is ephemeral** — it rotates every time the VM is stopped/started. Don't hard‑code it;
-  put it in one config value. If you suddenly get connection‑refused / 502, the IP rotated —
-  ping me for the new one (a static IP is on the to‑do list).
+  If you already integrated against an old address, the *only* thing you touch is the base URL.
+- Still keep the base URL in one config value, not sprinkled through the code. Note it's plain
+  HTTP (no TLS yet), so call it from your backend only.
 
 ---
 
@@ -24,9 +24,9 @@
 
 | | |
 |---|---|
-| **Base URL** | `http://35.253.209.85:8080` |
-| **Interactive API docs** | `http://35.253.209.85:8080/docs` (Swagger UI — try every endpoint from the browser) |
-| **Health check** | `GET http://35.253.209.85:8080/health` → `{"status":"ok"}` (no auth) |
+| **Base URL** | `http://spark.jard.ai:8080` |
+| **Interactive API docs** | `http://spark.jard.ai:8080/docs` (Swagger UI — try every endpoint from the browser) |
+| **Health check** | `GET http://spark.jard.ai:8080/health` → `{"status":"ok"}` (no auth) |
 | **Auth header** | `X-API-Key: 7db96b28bfafe87a851c22000e9758c5` |
 
 - The header is **exactly** `X-API-Key`. There is **no** `Bearer` prefix and **no** `Authorization` header.
@@ -89,7 +89,7 @@ All accept an optional **`output_language`** (see §5).
 | `output_language` | string | | Language the **notes are written in** (see §5). Default `EN` |
 
 ```bash
-curl -X POST http://35.253.209.85:8080/v1/summarize \
+curl -X POST http://spark.jard.ai:8080/v1/summarize \
   -H "X-API-Key: 7db96b28bfafe87a851c22000e9758c5" \
   -H "Content-Type: application/json" \
   -d '{ "video_url": "https://cdn.example.com/lecture.mp4", "title": "Week 1", "language": "en" }'
@@ -101,7 +101,7 @@ Downloaded server‑side with `yt-dlp` (≤720p). Same fields as 3.1 **except** 
 and if you omit `title` the video's own YouTube title is used.
 
 ```bash
-curl -X POST http://35.253.209.85:8080/v1/summarize/youtube \
+curl -X POST http://spark.jard.ai:8080/v1/summarize/youtube \
   -H "X-API-Key: 7db96b28bfafe87a851c22000e9758c5" \
   -H "Content-Type: application/json" \
   -d '{ "url": "https://youtu.be/jNQXAC9IVRw" }'
@@ -118,7 +118,7 @@ curl -X POST http://35.253.209.85:8080/v1/summarize/youtube \
 | `title` / `domain` / `intent` / `language` / `output_language` | | | As above (form fields) |
 
 ```bash
-curl -X POST http://35.253.209.85:8080/v1/summarize/upload \
+curl -X POST http://spark.jard.ai:8080/v1/summarize/upload \
   -H "X-API-Key: 7db96b28bfafe87a851c22000e9758c5" \
   -F "file=@/path/to/lecture.mp4" \
   -F "title=Quantum Mechanics" \
@@ -140,7 +140,7 @@ Same pipeline, same PDF/`.tex` output.
 | `language` / `output_language` | | | As above |
 
 ```bash
-curl -X POST http://35.253.209.85:8080/v1/summarize/custom \
+curl -X POST http://spark.jard.ai:8080/v1/summarize/custom \
   -H "X-API-Key: 7db96b28bfafe87a851c22000e9758c5" \
   -H "Content-Type: application/json" \
   -d '{
@@ -167,7 +167,7 @@ in submission order. Direct URLs and YouTube links can be mixed in one stack.
 | `domain` / `intent` / `language` / `output_language` | | | Applied to the **whole** stack |
 
 ```bash
-curl -X POST http://35.253.209.85:8080/v1/summarize/multi \
+curl -X POST http://spark.jard.ai:8080/v1/summarize/multi \
   -H "X-API-Key: 7db96b28bfafe87a851c22000e9758c5" \
   -H "Content-Type: application/json" \
   -d '{
@@ -186,7 +186,7 @@ becomes its section title). Mixing local files and URLs in one stack is **not** 
 endpoint per job.
 
 ```bash
-curl -X POST http://35.253.209.85:8080/v1/summarize/multi/upload \
+curl -X POST http://spark.jard.ai:8080/v1/summarize/multi/upload \
   -H "X-API-Key: 7db96b28bfafe87a851c22000e9758c5" \
   -F "files=@part1.mp4" -F "files=@part2.mp4" -F "files=@part3.mp4" \
   -F "title=Databases — Full Lecture"
@@ -278,8 +278,8 @@ Job‑level failures surface in `JobStatus.error` (not as an HTTP error), e.g.
 whole job and `error` names which one (`"Video 2/3 (…): …"`); fix that one and resubmit.
 
 **Two sharp edges to handle in the app:**
-- **Connection refused / 502** → the VM IP rotated. Surface "service address changed" and ping me;
-  don't retry‑loop forever.
+- **Connection refused / 502** → the server is likely down or restarting. Surface "service
+  unavailable" and ping me; don't retry‑loop forever.
 - **401** → key misconfigured or rotated server‑side.
 
 ---
@@ -287,7 +287,7 @@ whole job and `error` names which one (`"Video 2/3 (…): …"`); fix that one a
 ## 8. Minimal end‑to‑end client (TypeScript)
 
 ```typescript
-const BASE = process.env.JARD_BASE_URL!;   // "http://35.253.209.85:8080" — config value, IP rotates
+const BASE = process.env.JARD_BASE_URL!;   // "http://spark.jard.ai:8080" — keep as config value
 const KEY  = process.env.JARD_API_KEY!;    // header name is exactly "X-API-Key"
 
 async function summarizeUrl(videoUrl: string, outputLanguage = "en") {
@@ -321,14 +321,14 @@ For an in‑app **text** view instead of the PDF, fetch `tex_url` and strip the 
 ## 9. Quick smoke test (paste into a terminal)
 
 ```bash
-BASE="http://35.253.209.85:8080"
+BASE="http://spark.jard.ai:8080"
 KEY="7db96b28bfafe87a851c22000e9758c5"
 
 curl -s "$BASE/health"                          # → {"status":"ok"}
 curl -s "$BASE/v1/jobs" -H "X-API-Key: $KEY"    # → {"jobs":[...]}  (401 means bad key)
 ```
 
-If `/health` doesn't answer, the IP has almost certainly rotated — ping me for the current one.
+If `/health` doesn't answer, the server is down or restarting — ping me.
 
 ---
 
