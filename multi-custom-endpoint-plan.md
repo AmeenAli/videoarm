@@ -1,6 +1,7 @@
 # Implementation Plan — `POST /v1/summarize/multi/custom`
 
-> **Status:** PLAN ONLY — not implemented yet.
+> **Status:** IMPLEMENTED & DEPLOYED (29 Jul 2026) — offline suite `test_multi_custom.py`
+> (31 checks) + live 2-video smoke test passed; docs updated (ENDPOINTS.md §8, handoff §3.7).
 > **Goal:** custom-prompt processing (à la `/v1/summarize/custom`) over an ordered stack
 > of 1–8 videos (à la `/v1/summarize/multi`) → one combined PDF + `.tex`.
 > **Approach:** pure composition of existing infrastructure. No new services, no schema

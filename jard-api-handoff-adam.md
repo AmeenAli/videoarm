@@ -195,6 +195,36 @@ curl -X POST http://spark.jard.ai:8080/v1/summarize/multi/upload \
 > In fetch/axios, append the same field name repeatedly: `form.append("files", f1); form.append("files", f2)`.
 > Do **not** set `Content-Type` yourself on multipart — let the client set the boundary.
 
+### 3.7 Multi‑video custom prompts — `POST /v1/summarize/multi/custom`  ·  `application/json`
+
+The multi pipeline (3.5) driven by **your own prompts** (3.4): one combined PDF, one
+section per video in submission order. `system_prompt` replaces the built‑in note‑taker
+(end it with "Output LaTeX body only."); `user_prompt` is applied per segment of every
+video with that segment's transcript/visual notes/figures appended automatically. Same
+fields as 3.5 **except**: `system_prompt` + `user_prompt` are required (1–20000 chars,
+422 otherwise), `category` is optional bookkeeping, and there is **no** `domain`/`intent`
+— your prompts own the instruction space. URL + YouTube sources only (no upload variant).
+
+```bash
+curl -X POST http://spark.jard.ai:8080/v1/summarize/multi/custom \
+  -H "X-API-Key: 7db96b28bfafe87a851c22000e9758c5" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "videos": [
+      {"url": "https://youtu.be/aaa", "title": "Episode 1"},
+      {"url": "https://cdn.example.com/ep2.mp4", "title": "Episode 2"}
+    ],
+    "title": "Season Review",
+    "system_prompt": "You are a senior film editor… Output LaTeX body only.",
+    "user_prompt": "Evaluate pacing, shot composition, and narrative clarity."
+  }'
+```
+
+To get screenshots in the output, add the FIGURES paragraph to your `system_prompt`
+(see the figures explainer / ENDPOINTS.md "Screenshots" section); figure files are
+namespaced per video (`v01_seg01_fig0.jpg`, `v02_…`) and downloadable via
+`GET /v1/jobs/{job_id}/images`.
+
 ---
 
 ## 4. Poll & download

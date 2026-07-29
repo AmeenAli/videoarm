@@ -3,6 +3,7 @@ Multi-video endpoints — submit a STACK of videos as ONE job → ONE combined P
 
 POST /v1/summarize/multi         JSON: list of direct-URL / YouTube sources
 POST /v1/summarize/multi/upload  multipart: several `files` parts
+POST /v1/summarize/multi/custom  JSON: sources + custom system/user prompts
 
 Both return 202 + a job_id; polling and download use the same /v1/jobs/*
 endpoints as single-video jobs. The finished document contains one \\section
@@ -35,6 +36,10 @@ from videoarm.latex.languages import normalize_code
 # large stack mostly means a long job, but each source is also downloaded to
 # local disk first — keep the cap modest.
 MAX_MULTI_VIDEOS = int(os.getenv("VIDEOARM_MAX_MULTI_VIDEOS", "8"))
+
+# Upper bound for caller-supplied prompts on /multi/custom (chars). Read from the
+# env rather than imported from server.py — that back-import is circular.
+MAX_PROMPT_CHARS = int(os.getenv("VIDEOARM_MAX_PROMPT_CHARS", "20000"))
 
 router = APIRouter()
 
@@ -70,6 +75,22 @@ class MultiRequest(BaseModel):
     output_language: str = "en"                # written-notes language, job-wide
 
 
+class MultiCustomRequest(BaseModel):
+    """One job over an ordered stack of videos, generated with the caller's own
+    prompts (à la /v1/summarize/custom) → one combined document.
+
+    No `domain`/`intent`: as on the single /custom endpoint, the caller's prompts
+    own the instruction space."""
+    videos:          List[MultiVideoSource] = Field(min_length=1,
+                                                    max_length=MAX_MULTI_VIDEOS)
+    system_prompt:   str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
+    user_prompt:     str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
+    title:           str = "Combined Notes"   # title of the combined document
+    category:        Optional[str] = None     # bookkeeping only, like /custom
+    language:        Optional[str] = None     # spoken/ASR language, job-wide
+    output_language: str = "en"               # written-notes language, job-wide
+
+
 class JobAccepted(BaseModel):
     """Submit response — poll /v1/jobs/{job_id} for the full status."""
     job_id: str
@@ -101,6 +122,55 @@ def submit_multi(req: MultiRequest, _: None = Depends(_require_key)) -> JobAccep
                 sources_json=json.dumps(sources))
     srv._executor.submit(_run_multi_job, job_id, sources, req.title,
                          req.language, req.domain, req.intent, out_lang)
+    return JobAccepted(job_id=job_id)
+
+
+@router.post("/v1/summarize/multi/custom", response_model=JobAccepted, status_code=202)
+def submit_multi_custom(req: MultiCustomRequest,
+                        _: None = Depends(_require_key)) -> JobAccepted:
+    """Submit an ordered stack of video URLs (direct and/or YouTube, freely mixed)
+    to be processed as ONE job with the caller's own generation prompts →
+    ONE combined PDF, one \\section per video in submission order.
+
+    Prompt semantics (same as /v1/summarize/custom, applied to every video):
+    `system_prompt` replaces the built-in note-taker instruction; `user_prompt`
+    is applied per segment with that segment's transcript / visual notes /
+    figures appended automatically. Tell the model to output a LaTeX body only.
+
+    Example::
+
+        curl -X POST http://HOST:8080/v1/summarize/multi/custom \\
+          -H "X-API-Key: $VIDEOARM_API_KEY" \\
+          -H "Content-Type: application/json" \\
+          -d '{
+                "videos": [
+                  {"url": "https://youtu.be/aaa", "title": "Episode 1"},
+                  {"url": "https://cdn.example.com/ep2.mp4", "title": "Episode 2"}
+                ],
+                "title": "Season Review",
+                "category": "video-editing-analysis",
+                "system_prompt": "You are a senior film editor... Output LaTeX body only.",
+                "user_prompt": "Evaluate pacing, composition, and narrative clarity."
+              }'
+    """
+    from videoarm.api import server as srv  # noqa: PLC0415
+
+    sources: List[Dict[str, Any]] = []
+    for v in req.videos:
+        url  = str(v.url)
+        kind = v.kind or ("youtube" if srv._is_youtube(url) else "url")
+        sources.append({"kind": kind, "url": url, "title": v.title})
+
+    job_id   = uuid.uuid4().hex[:10]
+    out_lang = normalize_code(req.output_language)
+    srv._insert(job_id, status="queued", source="multi", title=req.title,
+                language=req.language, output_language=out_lang,
+                category=req.category,
+                system_prompt=req.system_prompt, user_prompt=req.user_prompt,
+                sources_json=json.dumps(sources))
+    srv._executor.submit(_run_multi_job, job_id, sources, req.title,
+                         req.language, "", "", out_lang,
+                         req.system_prompt, req.user_prompt)
     return JobAccepted(job_id=job_id)
 
 
@@ -162,6 +232,8 @@ def _run_multi_job(
     domain: str,
     intent: str,
     output_language: str,
+    system_prompt: Optional[str] = None,
+    user_prompt: Optional[str] = None,
 ) -> None:
     """Download every source, then run MultiVideoSummarizer over the stack.
 
@@ -231,6 +303,8 @@ def _run_multi_job(
             domain=domain,
             intent=intent,
             on_progress=_on_progress,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             output_language=output_language,
         )
         tex_path = pdf_path.replace(".pdf", ".tex") if pdf_path else None
@@ -271,4 +345,6 @@ def resume_multi_job(row) -> None:
         return
 
     _run_multi_job(job_id, sources, row["title"], row["language"],
-                   row["domain"], row["intent"], row["output_language"] or "en")
+                   row["domain"] or "", row["intent"] or "",
+                   row["output_language"] or "en",
+                   row["system_prompt"], row["user_prompt"])

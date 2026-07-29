@@ -242,10 +242,11 @@ def build_and_compile(
     Returns:
         Absolute path to the generated PDF.
     """
-    doc = build_latex_document(body, title, course, author, output_language)
-
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    body = _strip_missing_figures(body, out)
+    doc = build_latex_document(body, title, course, author, output_language)
 
     tex_path = out / f"{stem}.tex"
     tex_path.write_text(doc, encoding="utf-8")
@@ -258,6 +259,46 @@ def build_and_compile(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+_FIGURE_ENV_RE = re.compile(r"\\begin\{figure\}.*?\\end\{figure\}", re.DOTALL)
+_INCLUDEGRAPHICS_RE = re.compile(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}")
+
+
+def _strip_missing_figures(body: str, output_dir: Path) -> str:
+    """Drop figure blocks / \\includegraphics whose image file does not exist.
+
+    The generation model occasionally hallucinates image paths (e.g.
+    ``placeholder_frame_001.png``) that were never extracted. xelatex in
+    nonstopmode dies midway on the first unloadable picture and still leaves a
+    truncated PDF on disk, so these must never reach the compiler."""
+
+    def _exists(p: str) -> bool:
+        path = Path(p)
+        return (path if path.is_absolute() else output_dir / path).exists()
+
+    dropped = 0
+
+    def _filter_env(m: re.Match) -> str:
+        nonlocal dropped
+        block = m.group(0)
+        if all(_exists(p) for p in _INCLUDEGRAPHICS_RE.findall(block)):
+            return block
+        dropped += 1
+        return ""
+
+    def _filter_bare(m: re.Match) -> str:
+        nonlocal dropped
+        if _exists(m.group(1)):
+            return m.group(0)
+        dropped += 1
+        return ""
+
+    body = _FIGURE_ENV_RE.sub(_filter_env, body)
+    body = _INCLUDEGRAPHICS_RE.sub(_filter_bare, body)
+    if dropped:
+        print(f"⚠  Dropped {dropped} figure reference(s) with missing image files")
+    return body
+
 
 def _escape_text(text: str) -> str:
     """Escape LaTeX special characters in plain text (NOT in math/LaTeX body)."""
@@ -311,17 +352,21 @@ def _compile_pdf(tex_path: Path, runs: int = 2) -> Path:
             raise RuntimeError("pdflatex timed out after 180 s.")
 
     pdf_path = tex_path.with_suffix(".pdf")
-    if not pdf_path.exists():
-        log_path = tex_path.with_suffix(".log")
-        errors = ""
-        if log_path.exists():
-            log = log_path.read_bytes().decode("utf-8", errors="replace")
-            errors = "\n".join(
-                l for l in log.splitlines()
-                if l.startswith("!") or "Error" in l
-            )[:1000]
+    log_path = tex_path.with_suffix(".log")
+    log = (log_path.read_bytes().decode("utf-8", errors="replace")
+           if log_path.exists() else "")
+    # "Output written on" only appears when xelatex reached \end{document}.
+    # Without it any PDF on disk is a truncated partial from an aborted run —
+    # shipping that as "done" is worse than failing the job.
+    if not pdf_path.exists() or "Output written on" not in log:
+        errors = "\n".join(
+            l for l in log.splitlines()
+            if l.startswith("!") or "Error" in l
+        )[:1000]
         raise RuntimeError(
-            f"pdflatex (exit {last_returncode}) produced no PDF.\n{errors}"
+            f"pdflatex (exit {last_returncode}) "
+            f"{'produced no PDF' if not pdf_path.exists() else 'aborted mid-document (truncated PDF)'}."
+            f"\n{errors}"
         )
 
     # Clean auxiliary files

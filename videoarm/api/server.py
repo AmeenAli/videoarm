@@ -9,7 +9,8 @@ POST /v1/summarize/upload   Upload a local video file
 POST /v1/summarize/custom   Submit a video URL (direct or YouTube) with a custom
                             system_prompt + user_prompt (non-lecture categories)
 POST /v1/summarize/multi    Submit a STACK of videos as one job → one combined
-                            PDF (see videoarm/api/multi.py; also /multi/upload)
+                            PDF (see videoarm/api/multi.py; also /multi/upload
+                            and /multi/custom for caller-supplied prompts)
 GET  /v1/jobs               List all jobs (newest first)
 GET  /v1/jobs/{job_id}      Poll job status
 GET  /v1/jobs/{job_id}/pdf  Download the finished PDF
