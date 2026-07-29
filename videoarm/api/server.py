@@ -13,6 +13,9 @@ POST /v1/summarize/multi    Submit a STACK of videos as one job → one combined
 GET  /v1/jobs               List all jobs (newest first)
 GET  /v1/jobs/{job_id}      Poll job status
 GET  /v1/jobs/{job_id}/pdf  Download the finished PDF
+GET  /v1/jobs/{job_id}/tex  Download the LaTeX source
+GET  /v1/jobs/{job_id}/images             List the screenshot files the .tex references
+GET  /v1/jobs/{job_id}/images/{filename}  Download one screenshot file
 GET  /health                Health check
 
 Auth: X-API-Key header (set VIDEOARM_API_KEY env var, default: "change-me")
@@ -23,6 +26,7 @@ can batch inference requests across users automatically.
 """
 
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -561,6 +565,61 @@ def download_tex(job_id: str, _: None = Depends(_require_key)) -> FileResponse:
     if not tex_path or not Path(tex_path).exists():
         raise HTTPException(status_code=500, detail="LaTeX file missing on disk")
     return FileResponse(tex_path, media_type="text/x-tex", filename=f"{job_id}.tex")
+
+
+_IMAGE_MEDIA_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+}
+_IMAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _figures_dir(row) -> Path:
+    """The job's figures directory. Screenshots are copied here by the pipeline
+    and referenced from the .tex as ``figures/<filename>``."""
+    tex_path = row["tex_path"]
+    job_dir = Path(tex_path).parent if tex_path else OUTPUT_ROOT / row["job_id"]
+    return job_dir / "figures"
+
+
+@app.get("/v1/jobs/{job_id}/images")
+def list_images(job_id: str, _: None = Depends(_require_key)) -> dict:
+    """List the screenshot files extracted for a job.
+
+    The ``.tex`` references them as ``figures/<filename>`` — strip the
+    ``figures/`` prefix to match against ``filename`` here. Files appear while
+    the job is processing; the list is complete once status is ``done``.
+    A job can legitimately have zero images (nothing figure-worthy was found,
+    or the prompts opted out of figures).
+    """
+    row = _get(job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    figures_dir = _figures_dir(row)
+    images = []
+    if figures_dir.is_dir():
+        for p in sorted(figures_dir.iterdir()):
+            if p.is_file() and p.suffix.lower() in _IMAGE_MEDIA_TYPES:
+                images.append({
+                    "filename": p.name,
+                    "bytes": p.stat().st_size,
+                    "url": f"/v1/jobs/{job_id}/images/{p.name}",
+                })
+    return {"job_id": job_id, "status": row["status"], "count": len(images), "images": images}
+
+
+@app.get("/v1/jobs/{job_id}/images/{filename}")
+def download_image(job_id: str, filename: str, _: None = Depends(_require_key)) -> FileResponse:
+    """Download one screenshot file (as listed by /v1/jobs/{job_id}/images)."""
+    row = _get(job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    media_type = _IMAGE_MEDIA_TYPES.get(Path(filename).suffix.lower())
+    if not _IMAGE_NAME_RE.fullmatch(filename) or ".." in filename or media_type is None:
+        raise HTTPException(status_code=404, detail="Image not found")
+    path = _figures_dir(row) / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(path, media_type=media_type, filename=filename)
 
 
 @app.get("/health")

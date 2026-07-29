@@ -1,7 +1,7 @@
 # Jard.ai — How Screenshots (Figures) in the Output Work
 
 > Answers "where do the images in the PDF come from, and do I have to ask for them?"
-> **Owner:** Ameen. **Last updated:** 28 July 2026.
+> **Owner:** Ameen. **Last updated:** 29 July 2026.
 
 ---
 
@@ -50,11 +50,14 @@ of a stack never collide in the combined document.
 
 ## Custom endpoints — the one thing to know
 
-On `/v1/summarize/custom` (and the upcoming multi-custom endpoint), frame extraction
-and selection still run automatically, and the selected screenshots (path + caption)
-are appended to your `user_prompt` alongside the transcript. But since **your**
-`system_prompt` replaces the built-in note-taker instructions, the model only has a
-light hint about what to do with them.
+On `/v1/summarize/custom`, frame extraction and selection run automatically, and the
+selected screenshots (path + caption) are appended to your `user_prompt` alongside the
+transcript. Since 29 Jul 2026 the **selector judges frames against your prompts** rather
+than the lecture rubric — so a film-analysis job gets key shots and compositions, not
+just diagrams. (Before this fix the lecture-only selector rejected every frame of
+non-lecture videos, which is why custom jobs came back with zero screenshots.) But since
+**your** `system_prompt` replaces the built-in note-taker instructions, the model only
+has a light hint about what to do with them.
 
 To make figure behaviour deterministic, say it explicitly in your `system_prompt`:
 
@@ -74,12 +77,15 @@ To make figure behaviour deterministic, say it explicitly in your `system_prompt
 
 The **PDF has the screenshots embedded** — it is self-contained, always safe to serve.
 
-The **`.tex` source references the images by relative path** (`figures/…`), but the
-API has **no endpoint to download the image files themselves**. So:
+The **`.tex` source references the images by relative path** (`figures/…`), and since
+29 Jul 2026 the API serves those files too:
 
-- Using the `.tex` for text extraction / stripping LaTeX / feeding an LLM → totally fine.
-- Trying to **recompile the `.tex` yourself** → it won't have the images. If you ever
-  need that, ping me and I'll add a figures download.
+- `GET /v1/jobs/{job_id}/images` — JSON list of every screenshot file (filename, bytes, url)
+- `GET /v1/jobs/{job_id}/images/{filename}` — the image bytes
+
+To recompile or preview the `.tex` yourself: download the `.tex`, list the images,
+save each file into a `figures/` directory next to the `.tex` — the relative paths
+then resolve. Full request/response examples are in `ENDPOINTS.md`.
 
 ---
 
@@ -95,5 +101,7 @@ API has **no endpoint to download the image files themselves**. So:
 | How many? | Up to 3 per 5-minute segment |
 | Is there an API flag to toggle figures? | Not currently — the custom prompt is the control; ask if you need a flag |
 | Are images in the `.tex` download? | Referenced by path only; embedded in the PDF |
+| Can I download the image files? | Yes — `GET /v1/jobs/{id}/images` (list) and `…/images/{filename}` (file) |
+| What picks frames on `/custom`? | The selector reads your prompts and picks frames relevant to *your* task |
 
 *Questions — Ameen.*

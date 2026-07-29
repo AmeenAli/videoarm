@@ -222,6 +222,38 @@ Which frames contain diagrams, plots, or figures worth including in lecture note
 Return JSON only.\
 """
 
+# Custom-prompt jobs are not lectures: the lecture selector above rejects
+# everything that isn't a diagram/plot (including every frame of e.g. a film
+# being analysed), which left custom jobs with zero screenshots. Judge frames
+# against the caller's actual task instead.
+_FIGURE_SELECTION_SYSTEM_CUSTOM = """\
+You are reviewing individual frames from a video to decide which are worth \
+including verbatim as figures (screenshots) in a written document about that \
+video. Judge each frame by how much it would add to THE DOCUMENT'S TASK below \
+— not by lecture-notes criteria.
+
+═══ THE DOCUMENT'S TASK ═══
+{task_context}
+
+SELECT a frame if it is visually informative for that task, for example:
+  • Key shots, compositions, or scene moments the document would discuss
+  • Diagrams, charts, on-screen text or graphics, UI screens, product views
+  • Any visual whose content the document would reference or analyse
+
+DO NOT SELECT:
+  • Blurry, duplicate, transitional, or near-identical frames
+  • Frames that add nothing over ones already selected
+
+Respond with ONLY a valid JSON array — no prose, no markdown fences.
+Each element: {{"frame_index": <int>, "caption": "<concise descriptive caption>"}}
+Maximum 3 elements. If nothing qualifies, return [].\
+"""
+
+_FIGURE_SELECTION_USER_CUSTOM = """\
+Frames {start_time:.0f}s–{end_time:.0f}s ({n_frames} frames, indices 0–{last_idx}).
+Which frames are worth including as figures in the document? Return JSON only.\
+"""
+
 _SEGMENT_SYNTHESIS_USER = """\
 Write comprehensive, well-structured LaTeX lecture notes for the following \
 {duration:.1f}-minute segment (segment {seg_num}/{total_segs}, \
@@ -449,6 +481,10 @@ class LectureSummarizer:
         self._output_dir  = output_dir
         self._figure_prefix = figure_prefix
         self._custom_user_prompt = (user_prompt or "").strip() or None
+        # Task context handed to the figure selector on custom jobs so frame
+        # choice matches the caller's document, not the lecture rubric.
+        _task_bits = [(system_prompt or "").strip(), (user_prompt or "").strip()]
+        self._custom_task_context = "\n\n".join(b for b in _task_bits if b)[:800] or None
 
         lang_spec = resolve(output_language)
         self._output_language = lang_spec.code
@@ -921,12 +957,23 @@ class LectureSummarizer:
             return []
 
         n = len(frame_paths)
-        user_msg = _FIGURE_SELECTION_USER.format(
-            start_time=seg["start_time"],
-            end_time=seg["end_time"],
-            n_frames=n,
-            last_idx=n - 1,
-        )
+        task_context = getattr(self, "_custom_task_context", None)
+        if task_context:
+            system_msg = _FIGURE_SELECTION_SYSTEM_CUSTOM.format(task_context=task_context)
+            user_msg = _FIGURE_SELECTION_USER_CUSTOM.format(
+                start_time=seg["start_time"],
+                end_time=seg["end_time"],
+                n_frames=n,
+                last_idx=n - 1,
+            )
+        else:
+            system_msg = _FIGURE_SELECTION_SYSTEM
+            user_msg = _FIGURE_SELECTION_USER.format(
+                start_time=seg["start_time"],
+                end_time=seg["end_time"],
+                n_frames=n,
+                last_idx=n - 1,
+            )
 
         model     = self.config.get_model("clip_analyzer")
         api_key, base_url = self.config.get_api_config("clip_analyzer")
@@ -941,7 +988,7 @@ class LectureSummarizer:
             response = self.agent._run_with_retry(
                 lambda: call_openai_model_with_tools(
                     messages=[
-                        {"role": "system", "content": _FIGURE_SELECTION_SYSTEM},
+                        {"role": "system", "content": system_msg},
                         {"role": "user",   "content": user_msg},
                     ],
                     model_name=model,
@@ -980,7 +1027,7 @@ class LectureSummarizer:
             print(f"│       Figure {len(results)}: {rel_path} — {caption[:60]}")
 
         if not results:
-            print("│       No figure-worthy frames found.")
+            print(f"│       No figure-worthy frames found (model said: {raw[:160]!r})")
         return results
 
     # ------------------------------------------------------------------ #
