@@ -25,13 +25,15 @@ from typing import Any, Dict, Literal, Optional
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+
+from videoarm.config.settings import (
+    DEFAULT_WINDOW_SECS,
+    MAX_WINDOW_SECS,
+    MIN_WINDOW_SECS,
+)
 
 router = APIRouter()
-
-# Timeline resolution bounds (seconds per window).
-MIN_WINDOW_SECS = 10
-MAX_WINDOW_SECS = 300
 
 
 def _require_key(x_api_key: str = Header()) -> None:
@@ -51,15 +53,75 @@ class DescribeRequest(BaseModel):
     source:      DescribeSource
     title:       Optional[str] = None
     language:    Optional[str] = None   # spoken-language hint for ASR
-    window_secs: int = Field(default=60, ge=MIN_WINDOW_SECS, le=MAX_WINDOW_SECS)
+    window_secs: int = Field(
+        default=DEFAULT_WINDOW_SECS,
+        # Bounds are advertised to OpenAPI here but enforced in the validator
+        # below: pydantic's own ge/le run first and would mask the explanatory
+        # message with "Input should be greater than or equal to 1".
+        json_schema_extra={"minimum": MIN_WINDOW_SECS, "maximum": MAX_WINDOW_SECS},
+        description=(
+            f"Timeline resolution in seconds per window "
+            f"({MIN_WINDOW_SECS}–{MAX_WINDOW_SECS}, default {DEFAULT_WINDOW_SECS}). "
+            "Every window gets its own visual observation, keyframes and "
+            "transcript. Cost and latency scale inversely: halving this "
+            "roughly doubles the number of model calls, so a 1s timeline over "
+            "a long video is expensive. Transcript utterances may span several "
+            "windows below the ASR chunk size — see params.asr_chunk_secs in "
+            "the result."
+        ),
+    )
     keyframes:   bool = True
 
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "source": {"url": "https://youtu.be/xyz"},
+                    "window_secs": 30,
+                    "keyframes": True,
+                }
+            ]
+        }
+    }
 
-@router.post("/v1/describe", status_code=202)
-def submit_describe(req: DescribeRequest, _: None = Depends(_require_key)) -> dict:
+    @field_validator("window_secs")
+    @classmethod
+    def _check_window(cls, v: int) -> int:
+        # Pydantic's own ge/le message ("Input should be ...") does not say what
+        # the field means or what the caller should do, and this is the value
+        # the app's resolution slider sends — make the failure self-explanatory.
+        if not (MIN_WINDOW_SECS <= v <= MAX_WINDOW_SECS):
+            raise ValueError(
+                f"window_secs must be between {MIN_WINDOW_SECS} and "
+                f"{MAX_WINDOW_SECS} seconds (got {v}). It is the timeline "
+                f"resolution: {MIN_WINDOW_SECS}s gives the finest timestamps "
+                f"at the highest cost, {MAX_WINDOW_SECS}s (2 min) the coarsest "
+                f"and cheapest. Omit the field for the {DEFAULT_WINDOW_SECS}s "
+                f"default."
+            )
+        return v
+
+
+class DescribeAccepted(BaseModel):
+    """202 response: the job is queued; poll /v1/jobs/{job_id}."""
+    job_id:      str
+    status:      str = "queued"
+    window_secs: int = Field(description="Effective timeline resolution applied "
+                                         "to this job, in seconds.")
+
+
+@router.post("/v1/describe", response_model=DescribeAccepted, status_code=202,
+             summary="Perception-only timeline (no reasoning)")
+def submit_describe(req: DescribeRequest,
+                    _: None = Depends(_require_key)) -> DescribeAccepted:
     """Submit a video for semantic description. Poll /v1/jobs/{job_id}; when
     done, fetch /v1/jobs/{job_id}/semantic (JSON) and the keyframe files via
     /v1/jobs/{job_id}/images.
+
+    `window_secs` is the timeline resolution in seconds (1–120, default 60):
+    the video is cut into windows of that length and each window is perceived
+    independently. Finer resolution means proportionally more model calls — a
+    1s timeline over an hour of video is ~60× the work of the 60s default.
 
     Example::
 
@@ -80,7 +142,8 @@ def submit_describe(req: DescribeRequest, _: None = Depends(_require_key)) -> di
                 describe_params=json.dumps({**params, "kind": kind}))
     srv._executor.submit(_run_describe_job, job_id, url, kind, req.title,
                          req.language, req.window_secs, req.keyframes)
-    return {"job_id": job_id, "status": "queued"}
+    return DescribeAccepted(job_id=job_id, status="queued",
+                            window_secs=req.window_secs)
 
 
 @router.get("/v1/jobs/{job_id}/semantic")
@@ -193,6 +256,6 @@ def resume_describe_job(row) -> None:
         row["job_id"], row["video_url"],
         params.get("kind") or "url",
         row["title"], row["language"],
-        int(params.get("window_secs") or 60),
+        int(params.get("window_secs") or DEFAULT_WINDOW_SECS),
         bool(params.get("keyframes", True)),
     )

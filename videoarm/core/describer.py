@@ -13,12 +13,20 @@ before the "understanding" layer.
 """
 
 import json
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from videoarm.api.client import call_openai_model_with_tools
+from videoarm.config.settings import (
+    DEFAULT_WINDOW_SECS,
+    DESCRIBE_CONCURRENCY,
+    MAX_WINDOW_SECS,
+    MIN_ASR_CHUNK_SECS,
+    MIN_WINDOW_SECS,
+)
 
 # ---------------------------------------------------------------------------
 # Prompts — observation only, explicitly no interpretation
@@ -26,8 +34,9 @@ from videoarm.api.client import call_openai_model_with_tools
 
 _OBSERVE_SYSTEM = """\
 You are a neutral visual observer converting video frames into a factual \
-record of what is on screen. The frames are presented in temporal order \
-(grid images read left-to-right, top-to-bottom).
+record of what is on screen. The frames are presented in temporal order; where \
+several frames are tiled into one grid image, read it left-to-right, \
+top-to-bottom.
 
 Report ONLY what is visibly present:
   • People: count, appearance, visible actions and gestures
@@ -68,6 +77,60 @@ Pick the representative frames. Return JSON only.\
 """
 
 
+def _utterances_for_window(
+    win: Dict[str, Any], utterances: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Utterances overlapping a window, keeping their own (true) spans.
+
+    When the timeline is finer than the ASR grid one utterance legitimately
+    appears in several consecutive windows; its `start`/`end` say so, and
+    `transcript_text` is built from the utterance list rather than from the
+    windows, so nothing is double-counted there.
+    """
+    return [
+        u for u in utterances
+        if u["end"] > win["start_time"] and u["start"] < win["end_time"]
+    ]
+
+
+def _assemble_document(
+    *,
+    title: Optional[str],
+    info: Dict[str, Any],
+    has_audio: bool,
+    window_secs: int,
+    asr_chunk_secs: float,
+    visual_fps: float,
+    keyframes: bool,
+    language: Optional[str],
+    timeline: List[Dict[str, Any]],
+    utterances: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build the semantic_timeline document (pure — no I/O, no model calls)."""
+    return {
+        "version": 1,
+        "kind": "semantic_timeline",
+        "video": {
+            "title": title,
+            "duration_s": round(info["total_frames"] / info["fps"], 2),
+            "fps": info["fps"],
+            "has_audio": has_audio,
+        },
+        "params": {
+            "window_secs": window_secs,
+            "asr_chunk_secs": asr_chunk_secs,
+            "windows": len(timeline),
+            "visual_fps": visual_fps,
+            "keyframes": keyframes,
+            "language": language,
+        },
+        "timeline": timeline,
+        "transcript_text": " ".join(
+            u["text"] for u in utterances if u["text"]
+        ).strip(),
+    }
+
+
 class SemanticDescriber:
     """Convert a video into a timestamped JSON perception timeline."""
 
@@ -76,8 +139,8 @@ class SemanticDescriber:
     GRID_COLS: int         = 3
     VISION_BATCH: int      = 5     # grid images per vision call
     KEYFRAME_SAMPLES: int  = 8     # 480px frames sampled per window for selection
-    KEYFRAME_MAX: int      = 2     # max keyframes kept per window
-    WINDOW_CONCURRENCY: int = 3    # windows processed in parallel
+    KEYFRAME_MAX: int      = 2     # max keyframes kept per window (long windows)
+    WINDOW_CONCURRENCY: int = DESCRIBE_CONCURRENCY  # windows processed in parallel
 
     def __init__(self, model_name: Optional[str] = None) -> None:
         from videoarm.core.agent import VideoARMAgent  # noqa: PLC0415
@@ -94,25 +157,26 @@ class SemanticDescriber:
         output_dir: str = "output",
         title: Optional[str] = None,
         language: Optional[str] = None,
-        window_secs: int = 60,
+        window_secs: int = DEFAULT_WINDOW_SECS,
         keyframes: bool = True,
         on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> Dict[str, Any]:
         """Run perception over the whole video and return the JSON document.
 
-        `window_secs` is the timeline resolution: each window gets its own
-        transcript chunk, visual observation, and (optionally) keyframes, all
-        stamped with the window's start/end in seconds. The local ASR returns
-        no per-word timestamps, so the transcript granularity IS the window —
-        smaller windows give finer timing at the cost of more model calls.
-        """
-        window_secs = max(10, min(300, int(window_secs)))
+        `window_secs` is the timeline resolution (1–120s): each window gets its
+        own visual observation, keyframes and transcript, stamped with the
+        window's start/end in seconds. Cost scales inversely — halving the
+        window roughly doubles the number of model calls.
 
-        print("=" * 60)
-        print("VideoARM — Semantic Describer")
-        print(f"  Video   : {video_path}")
-        print(f"  Window  : {window_secs}s  |  keyframes: {keyframes}")
-        print("=" * 60)
+        Audio is transcribed on a coarser grid than the timeline when the
+        windows are short (see MIN_ASR_CHUNK_SECS): the local ASR emits no
+        per-word timestamps, so an utterance can only be stamped with the span
+        of audio the model was given, and one-second slices cut words in half.
+        Each window therefore lists the utterances that overlap it, carrying
+        their own — possibly wider — spans. `params.asr_chunk_secs` reports the
+        transcript granularity actually used.
+        """
+        window_secs = max(MIN_WINDOW_SECS, min(MAX_WINDOW_SECS, int(window_secs)))
 
         start_wall = time.time()
         self.agent._initialize_video(video_path)
@@ -125,18 +189,38 @@ class SemanticDescriber:
         if keyframes:
             figures_dir.mkdir(parents=True, exist_ok=True)
 
-        windows = self._plan_windows(info, window_secs)
+        windows        = self._plan_windows(info, window_secs)
+        asr_chunks     = self._plan_asr_chunks(windows, window_secs)
+        asr_chunk_secs = (round(asr_chunks[0]["end_time"] - asr_chunks[0]["start_time"], 2)
+                          if asr_chunks else window_secs)
         total = len(windows)
+
+        print("=" * 60)
+        print("VideoARM — Semantic Describer")
+        print(f"  Video   : {video_path}")
+        print(f"  Window  : {window_secs}s  |  keyframes: {keyframes}")
+        print(f"  Timeline: {total} windows  |  ASR chunks: {len(asr_chunks)} "
+              f"@ {asr_chunk_secs:.0f}s")
+        print("=" * 60)
+        if total > 1000:
+            print(f"  ⚠  {total} windows at {window_secs}s resolution — expect "
+                  f"~{total * (2 if keyframes else 1) + len(asr_chunks)} model "
+                  f"calls. Coarser window_secs is much cheaper.")
+
         if on_progress:
             on_progress(0, total)
 
+        # Phase 1 — transcription on the (possibly coarser) ASR grid.
+        utterances = self._transcribe_all(video_path, asr_chunks, info, language)
+
+        # Phase 2 — per-window visual observation + keyframes.
         entries: List[Optional[Dict[str, Any]]] = [None] * total
         done = 0
         workers = max(1, min(self.WINDOW_CONCURRENCY, total))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(self._process_window, video_path, w, info,
-                            language, keyframes, figures_dir, i + 1, total): i
+                pool.submit(self._process_window, video_path, w, utterances,
+                            keyframes, figures_dir, i + 1, total): i
                 for i, w in enumerate(windows)
             }
             for fut in as_completed(futures):
@@ -146,29 +230,18 @@ class SemanticDescriber:
                 if on_progress:
                     on_progress(done, total)
 
-        timeline = [e for e in entries if e is not None]
-        transcript_text = " ".join(
-            u["text"] for e in timeline for u in e["transcript"] if u["text"]
-        ).strip()
-
-        doc = {
-            "version": 1,
-            "kind": "semantic_timeline",
-            "video": {
-                "title": title,
-                "duration_s": round(info["total_frames"] / info["fps"], 2),
-                "fps": info["fps"],
-                "has_audio": self.agent.video_has_audio,
-            },
-            "params": {
-                "window_secs": window_secs,
-                "visual_fps": self.VISUAL_FPS,
-                "keyframes": keyframes,
-                "language": language,
-            },
-            "timeline": timeline,
-            "transcript_text": transcript_text,
-        }
+        doc = _assemble_document(
+            title=title,
+            info=info,
+            has_audio=self.agent.video_has_audio,
+            window_secs=window_secs,
+            asr_chunk_secs=asr_chunk_secs,
+            visual_fps=self.VISUAL_FPS,
+            keyframes=keyframes,
+            language=language,
+            timeline=[e for e in entries if e is not None],
+            utterances=utterances,
+        )
 
         self.agent._cleanup_temp_frames()
         print(f"Semantic timeline built in {time.time() - start_wall:.0f}s "
@@ -180,9 +253,17 @@ class SemanticDescriber:
     # ------------------------------------------------------------------ #
 
     def _plan_windows(self, info: Dict[str, Any], window_secs: int) -> List[Dict[str, Any]]:
+        """Cut the video into contiguous windows of `window_secs`.
+
+        Windows tile the timeline without gaps: each one's `end_time` is the
+        next one's `start_time`. A trailing remainder shorter than a quarter of
+        a window is folded into the previous window rather than described on
+        its own — a 0.2s window costs the same model calls as a full one.
+        """
         fps          = info["fps"]
         total_frames = info["total_frames"]
-        win_frames   = max(1, int(window_secs * fps))
+        duration     = total_frames / fps
+        win_frames   = max(1, int(round(window_secs * fps)))
         windows: List[Dict[str, Any]] = []
         start = 0
         while start < total_frames:
@@ -191,59 +272,108 @@ class SemanticDescriber:
                 "start_frame": start,
                 "end_frame":   end,
                 "start_time":  start / fps,
-                "end_time":    end / fps,
+                "end_time":    min((end + 1) / fps, duration),
                 "duration":    (end - start + 1) / fps,
             })
             if end >= total_frames - 1:
                 break
             start = end + 1
+
+        if len(windows) > 1 and windows[-1]["duration"] < 0.25 * window_secs:
+            tail = windows.pop()
+            prev = windows[-1]
+            prev["end_frame"] = tail["end_frame"]
+            prev["end_time"]  = tail["end_time"]
+            prev["duration"]  = (prev["end_frame"] - prev["start_frame"] + 1) / fps
         return windows
+
+    def _plan_asr_chunks(
+        self, windows: List[Dict[str, Any]], window_secs: int,
+    ) -> List[Dict[str, Any]]:
+        """Group consecutive windows into audio chunks of >= MIN_ASR_CHUNK_SECS.
+
+        Chunks are a whole number of windows, so chunk boundaries always fall on
+        window boundaries. At the default resolution one chunk == one window,
+        which is the historical behaviour.
+        """
+        if not windows:
+            return []
+        per_chunk = max(1, math.ceil(MIN_ASR_CHUNK_SECS / max(1, window_secs)))
+        chunks: List[Dict[str, Any]] = []
+        for i in range(0, len(windows), per_chunk):
+            group = windows[i:i + per_chunk]
+            chunks.append({
+                "start_frame": group[0]["start_frame"],
+                "end_frame":   group[-1]["end_frame"],
+                "start_time":  group[0]["start_time"],
+                "end_time":    group[-1]["end_time"],
+            })
+        return chunks
+
+    def _transcribe_all(
+        self, video_path: str, chunks: List[Dict[str, Any]],
+        info: Dict[str, Any], language: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Transcribe every ASR chunk (in parallel) → utterances in time order."""
+        if not chunks:
+            return []
+        results: List[List[Dict[str, Any]]] = [[] for _ in chunks]
+        workers = max(1, min(self.WINDOW_CONCURRENCY, len(chunks)))
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(self._transcribe_chunk, video_path, c, info, language): i
+                for i, c in enumerate(chunks)
+            }
+            for fut in as_completed(futures):
+                results[futures[fut]] = fut.result()
+                done += 1
+                if done % 10 == 0 or done == len(chunks):
+                    print(f"│  Transcribed {done}/{len(chunks)} audio chunks")
+        return [u for group in results for u in group]
 
     def _process_window(
         self,
         video_path: str,
         win: Dict[str, Any],
-        info: Dict[str, Any],
-        language: Optional[str],
+        utterances: List[Dict[str, Any]],
         keyframes: bool,
         figures_dir: Path,
         num: int,
         total: int,
     ) -> Dict[str, Any]:
         t0, t1 = win["start_time"], win["end_time"]
-        print(f"┌─ Window {num}/{total} ({t0:.0f}s–{t1:.0f}s)")
-        transcript = self._transcribe_window(video_path, win, info, language)
-        visual     = self._observe_window(video_path, win)
-        kfs        = (self._select_keyframes(video_path, win, figures_dir)
-                      if keyframes else [])
-        print(f"└─ Window {num}/{total} done "
+        visual = self._observe_window(video_path, win)
+        kfs    = (self._select_keyframes(video_path, win, figures_dir)
+                  if keyframes else [])
+        print(f"└─ Window {num}/{total} ({t0:.1f}s–{t1:.1f}s) done "
               f"({len(visual)} chars visual, {len(kfs)} keyframes)")
         return {
             "start": round(t0, 2),
             "end":   round(t1, 2),
-            "transcript": transcript,
+            "transcript": _utterances_for_window(win, utterances),
             "visual": visual,
             "keyframes": kfs,
         }
 
-    def _transcribe_window(
-        self, video_path: str, win: Dict[str, Any], info: Dict[str, Any],
+    def _transcribe_chunk(
+        self, video_path: str, chunk: Dict[str, Any], info: Dict[str, Any],
         language: Optional[str],
     ) -> List[Dict[str, Any]]:
         """Return utterances [{start, end, text}]. The ASR gives global frame
         indices per transcription call; when it can't (plain-text fallback),
-        the utterance spans the whole window — timing is always present."""
+        the utterance spans the whole chunk — timing is always present."""
         fps = info["fps"]
         try:
             result = self.agent._audio_transcriber(
                 video_path=video_path,
-                frame_ranges=[{"start_frame": win["start_frame"],
-                               "end_frame":   win["end_frame"]}],
+                frame_ranges=[{"start_frame": chunk["start_frame"],
+                               "end_frame":   chunk["end_frame"]}],
                 reason="Semantic timeline transcription",
                 language=language,
             )
         except Exception as exc:
-            print(f"│  ⚠  ASR failed for window: {exc}")
+            print(f"│  ⚠  ASR failed for chunk: {exc}")
             return []
         if result.get("status") == "no_audio" or result.get("error"):
             return []
@@ -256,14 +386,14 @@ class SemanticDescriber:
             s = seg.get("start_frame", 0) / fps
             e = seg.get("end_frame", 0) / fps
             if e <= s:  # plain-text fallback carries no real timing
-                s, e = win["start_time"], win["end_time"]
+                s, e = chunk["start_time"], chunk["end_time"]
             utterances.append({"start": round(s, 2), "end": round(e, 2),
                                "text": text})
         if not utterances:
             text = (result.get("transcript_text") or "").strip()
             if text:
-                utterances = [{"start": round(win["start_time"], 2),
-                               "end":   round(win["end_time"], 2),
+                utterances = [{"start": round(chunk["start_time"], 2),
+                               "end":   round(chunk["end_time"], 2),
                                "text":  text}]
         return utterances
 
@@ -286,9 +416,15 @@ class SemanticDescriber:
         if not frame_paths:
             return ""
 
-        composites = self.agent._make_composite_grids(
-            frame_paths, rows=self.GRID_ROWS, cols=self.GRID_COLS)
-        images = [str(p) for p in composites] if composites else frame_paths
+        # Grids pad any incomplete tile with black. At fine resolutions a window
+        # holds fewer frames than one grid, so tiling would hand the model an
+        # image that is mostly black padding — send the frames as-is instead.
+        if len(frame_paths) < self.GRID_ROWS * self.GRID_COLS:
+            images = list(frame_paths)
+        else:
+            composites = self.agent._make_composite_grids(
+                frame_paths, rows=self.GRID_ROWS, cols=self.GRID_COLS)
+            images = [str(p) for p in composites] if composites else frame_paths
 
         model = self.config.get_model("clip_analyzer")
         api_key, base_url = self.config.get_api_config("clip_analyzer")
@@ -325,18 +461,32 @@ class SemanticDescriber:
                 print(f"│  ⚠  observation call failed: {exc}")
         return "\n".join(parts)
 
+    def _keyframe_budget(self, duration: float) -> tuple:
+        """(frames sampled, keyframes kept) for a window of `duration` seconds.
+
+        Sampling eight 480px frames to choose from — and keeping two of them —
+        only makes sense for a window with room for two distinct moments. Short
+        windows get proportionally fewer samples and a single keyframe, which
+        keeps a 1s timeline from emitting two near-identical screenshots per
+        second of video.
+        """
+        max_k   = self.KEYFRAME_MAX if duration >= 10 else 1
+        samples = min(self.KEYFRAME_SAMPLES, max(2, int(duration * 2)))
+        return samples, max_k
+
     def _select_keyframes(
         self, video_path: str, win: Dict[str, Any], figures_dir: Path,
     ) -> List[Dict[str, Any]]:
         import re      # noqa: PLC0415
         import shutil  # noqa: PLC0415
 
+        n_samples, max_k = self._keyframe_budget(win["duration"])
         try:
             frame_paths = self.agent._extract_frames_proportional(
                 video_path=video_path,
                 frame_ranges=[{"start_frame": win["start_frame"],
                                "end_frame":   win["end_frame"]}],
-                total_frames=self.KEYFRAME_SAMPLES,
+                total_frames=n_samples,
                 target_short_side=480,
                 silent=True,
                 session_id=f"{self.agent.session_id}_k{win['start_frame']}",
@@ -360,7 +510,7 @@ class SemanticDescriber:
                 lambda: call_openai_model_with_tools(
                     messages=[
                         {"role": "system",
-                         "content": _KEYFRAME_SYSTEM.format(max_k=self.KEYFRAME_MAX)},
+                         "content": _KEYFRAME_SYSTEM.format(max_k=max_k)},
                         {"role": "user",
                          "content": _KEYFRAME_USER.format(
                              start_time=win["start_time"],
@@ -382,7 +532,7 @@ class SemanticDescriber:
             return []
 
         results: List[Dict[str, Any]] = []
-        for item in selections[: self.KEYFRAME_MAX]:
+        for item in selections[:max_k]:
             idx = item.get("frame_index")
             caption = (item.get("caption") or "").strip()
             if not isinstance(idx, int) or not (0 <= idx < n):
