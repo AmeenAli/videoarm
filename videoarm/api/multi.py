@@ -279,6 +279,9 @@ def _run_multi_job(
                                 fh.write(chunk)
                     videos.append({"path": tmp, "title": src.get("title")})
 
+                from videoarm.core.ffmpeg_utils import ensure_decodable  # noqa: PLC0415
+                ensure_decodable(videos[-1]["path"])
+
             except Exception as exc:
                 raise RuntimeError(
                     f"Video {i}/{len(sources)} "

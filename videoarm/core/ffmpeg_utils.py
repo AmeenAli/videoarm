@@ -5,9 +5,13 @@ than require a system-wide install, fall back to the binary bundled with
 ``imageio-ffmpeg`` when ffmpeg is not on PATH.
 """
 
+import os
 import shutil
 import subprocess
+import time
 from functools import lru_cache
+from pathlib import Path
+from typing import Optional
 
 
 @lru_cache(maxsize=1)
@@ -68,3 +72,79 @@ def has_audio_stream(video_path: str) -> bool:
         for line in info.stderr.splitlines()
         if "Stream #" in line
     )
+
+
+# Codecs OpenCV's bundled ffmpeg cannot decode in software: its av1 decoder is
+# hwaccel-only (no libdav1d), so every cap.read() fails and frame extraction
+# would feed the vision model black frames.
+_OPENCV_UNDECODABLE = {"av1"}
+
+
+def video_codec(video_path: str) -> Optional[str]:
+    """Return the codec name of the first video stream, or None if unknown."""
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        probe = subprocess.run(
+            [
+                ffprobe, "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        return probe.stdout.strip() or None
+
+    info = subprocess.run(
+        [ffmpeg_path(), "-hide_banner", "-i", str(video_path)],
+        capture_output=True, text=True, timeout=10,
+    )
+    for line in info.stderr.splitlines():
+        if "Stream #" in line and "Video:" in line:
+            # "Stream #0:0 ...: Video: av1 (Main), yuv420p, ..."
+            return line.split("Video:")[1].strip().split(" ")[0].rstrip(",")
+    return None
+
+
+def ensure_decodable(video_path: str) -> None:
+    """Re-encode the file in place when OpenCV cannot decode its video codec.
+
+    AV1 sources (common for 4K YouTube/CDN files) must be converted before the
+    pipeline runs: the system ffmpeg decodes them fine (libdav1d), but OpenCV
+    does not, and silently-black frames produce hallucinated visual summaries.
+    Height is capped at 720p — frame sampling downsizes to a 256px short side
+    anyway — which also keeps the re-encode fast.
+    """
+    codec = video_codec(video_path)
+    if codec not in _OPENCV_UNDECODABLE:
+        return
+
+    src = Path(video_path)
+    tmp = src.with_name(src.stem + ".h264.tmp.mp4")  # same dir → atomic replace
+    print(f"│  Codec  : {codec} not decodable by OpenCV — re-encoding to H.264 …",
+          flush=True)
+    t0 = time.time()
+    try:
+        subprocess.run(
+            [
+                ffmpeg_path(), "-y", "-v", "error", "-i", str(src),
+                "-map", "0:v:0", "-map", "0:a?",
+                "-vf", "scale=-2:min(720\\,ih)",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "160k",
+                "-movflags", "+faststart", "-f", "mp4", str(tmp),
+            ],
+            check=True, capture_output=True, text=True, timeout=3 * 3600,
+        )
+    except subprocess.CalledProcessError as exc:
+        tmp.unlink(missing_ok=True)
+        tail = (exc.stderr or "").strip()[-500:]
+        raise RuntimeError(
+            f"Re-encoding {codec} video to H.264 failed: {tail}"
+        ) from exc
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, src)
+    print(f"│  Codec  : re-encoded to H.264 in {time.time() - t0:.0f}s", flush=True)

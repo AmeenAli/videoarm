@@ -142,6 +142,10 @@ def _run_describe_job(
                         fh.write(chunk)
 
         srv._set(job_id, status="processing", started_at=time.time())
+
+        from videoarm.core.ffmpeg_utils import ensure_decodable  # noqa: PLC0415
+        ensure_decodable(tmp_video)
+
         out_dir = srv.OUTPUT_ROOT / job_id
         out_dir.mkdir(parents=True, exist_ok=True)
 

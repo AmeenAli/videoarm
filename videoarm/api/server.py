@@ -658,6 +658,10 @@ def _process(
 ) -> None:
     try:
         _set(job_id, status="processing", started_at=time.time())
+
+        from videoarm.core.ffmpeg_utils import ensure_decodable  # noqa: PLC0415
+        ensure_decodable(video_path)
+
         out_dir = OUTPUT_ROOT / job_id
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -741,6 +745,9 @@ def _download_youtube(url: str, dest_dir: Path) -> tuple[str, Optional[str]]:
 
     base_opts = {
         "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        # Prefer H.264 over AV1/VP9 among matching formats: OpenCV cannot
+        # decode AV1, and ensure_decodable() would otherwise have to re-encode.
+        "format_sort": ["vcodec:h264"],
         "outtmpl": str(dest_dir / "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         # Point yt-dlp at our resolved ffmpeg so stream merging works even when

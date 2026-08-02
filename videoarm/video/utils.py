@@ -94,10 +94,12 @@ def get_cropped_frame_paths(
     fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 256
     fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 256
 
+    failed = 0
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         if not ret or frame is None:
+            failed += 1
             frame = np.zeros((fh, fw, 3), dtype=np.uint8)
 
         # Overlay global frame index (white text, top-left)
@@ -110,6 +112,19 @@ def get_cropped_frame_paths(
         frame_paths.append(str(out_path.resolve()))
 
     cap.release()
+
+    # A black placeholder for the odd unreadable frame is tolerable, but if
+    # NOTHING decoded the vision model would hallucinate an entire summary
+    # from black images (seen with AV1 sources OpenCV cannot decode).
+    if indices and failed == len(indices):
+        raise RuntimeError(
+            f"Failed to decode all {len(indices)} sampled frames from "
+            f"{video_path.name} — video codec likely unsupported by OpenCV "
+            f"(e.g. AV1). Re-encode the video to H.264."
+        )
+    if failed and not silent:
+        print(f"│  WARNING: {failed}/{len(indices)} frames failed to decode; "
+              f"black placeholders substituted")
 
     for p in frame_paths:
         if not Path(p).is_file():
